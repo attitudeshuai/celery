@@ -123,6 +123,16 @@ def default(task, app, consumer,
     handle = consumer.on_task_request
     limit_task = consumer._limit_task
     limit_post_eta = consumer._limit_post_eta
+
+    def borrow_qos(message):
+        # Access the QoS manager dynamically: it is recreated when the
+        # connection is rebuilt, after the strategies themselves.
+        qos = consumer.qos
+        qos.increment_eventually()
+        note_borrow = getattr(qos, 'note_borrow', None)
+        if note_borrow is not None:
+            note_borrow(message)
+
     Request = symbol_by_name(task.Request)
     Req = create_request_cls(Request, task, consumer.pool, hostname, eventer,
                              app=app)
@@ -191,7 +201,7 @@ def default(task, app, consumer,
             bucket = get_bucket(task.name)
 
         if eta and bucket:
-            consumer.qos.increment_eventually()
+            borrow_qos(message)
             req._eta_timer_entry = call_at(
                 eta, limit_post_eta, (req, bucket, 1), priority=6)
             # Only make the request visible to on_close()/query_task() once
@@ -203,7 +213,7 @@ def default(task, app, consumer,
             return
 
         if eta:
-            consumer.qos.increment_eventually()
+            borrow_qos(message)
             req._eta_timer_entry = call_at(
                 eta, apply_eta_task, (req,), priority=6)
             task_scheduled(req)

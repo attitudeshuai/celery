@@ -339,6 +339,17 @@ class Inspect:
         """
         return self._request('active_queues')
 
+    def queue_prefetch(self):
+        """Return per-queue prefetch target/actual values from workers.
+
+        Returns:
+            Dict: Dictionary ``{HOSTNAME: QUEUE_PREFETCH_INFO}`` where
+            ``QUEUE_PREFETCH_INFO`` maps each queue name to its
+            ``limit``, ``auto``, ``target``, ``actual``, ``held`` and
+            ``reclaimable`` values.
+        """
+        return self._request('queue_prefetch')
+
     def query_task(self, *ids):
         """Return details of tasks currently scheduled, reserved or executed by workers.
 
@@ -643,6 +654,25 @@ class Control:
         return self.broadcast(
             'cancel_consumer', destination=destination,
             arguments={'queue': queue}, **kwargs)
+
+    def set_queue_prefetch(self, queue, limit=None, destination=None,
+                           **kwargs):
+        """Tell workers to set, change or clear one queue's prefetch cap.
+
+        Arguments:
+            queue (str): Name of the queue to adjust.
+            limit (int): Positive per-queue prefetch cap.  When ``None``
+                an existing cap is cleared and the queue follows the
+                automatic prefetch value again.
+
+        See Also:
+            :meth:`broadcast` for supported keyword arguments.
+        """
+        return self.broadcast(
+            'set_queue_prefetch',
+            destination=destination,
+            arguments={'queue': queue, 'limit': limit},
+            **kwargs)
 
     def time_limit(self, task_name, soft=None, hard=None,
                    destination=None, **kwargs):

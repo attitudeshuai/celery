@@ -188,6 +188,10 @@ class test_inspect:
         self.inspect.active_queues()
         self.assert_broadcast_called('active_queues')
 
+    def test_queue_prefetch(self):
+        self.inspect.queue_prefetch()
+        self.assert_broadcast_called('queue_prefetch')
+
     def test_query_task(self):
         self.inspect.query_task('foo', 'bar')
         self.assert_broadcast_called('query_task', ids=('foo', 'bar'))
@@ -341,6 +345,24 @@ class test_Control:
             destination='w1@q.com',
             queue='foo',
             _options={'limit': 3},
+        )
+
+    def test_set_queue_prefetch(self):
+        self.app.control.set_queue_prefetch('foo', 4)
+        self.assert_control_called_with_args(
+            'set_queue_prefetch',
+            destination=None,
+            queue='foo',
+            limit=4,
+        )
+
+    def test_set_queue_prefetch__clear(self):
+        self.app.control.set_queue_prefetch('foo')
+        self.assert_control_called_with_args(
+            'set_queue_prefetch',
+            destination=None,
+            queue='foo',
+            limit=None,
         )
 
     def test_shutdown(self):

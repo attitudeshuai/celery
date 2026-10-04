@@ -646,3 +646,61 @@ def active_queues(state):
         return [dict(queue.as_dict(recurse=True))
                 for queue in state.consumer.task_consumer.queues]
     return []
+
+
+@inspect_command()
+def queue_prefetch(state, **kwargs):
+    """Report prefetch target/actual values for every consumed queue.
+
+    In legacy (global) mode only the shared channel value exists; in
+    per-queue mode every queue reports its configured ``limit``, the
+    ``auto`` value, the effective ``target`` (``min(limit, auto)``), the
+    ``actual`` broker window (never below the messages already held), the
+    ``held`` count and the still ``reclaimable`` credit.
+    """
+    consumer = state.consumer
+    qos = getattr(consumer, 'qos', None)
+    if qos is None:
+        return {'mode': 'disabled', 'prefetch_count': None, 'queues': {}}
+    info = getattr(qos, 'info', None)
+    if info is None:
+        # Plain kombu QoS instances only expose the shared value.
+        return {
+            'mode': 'global',
+            'prefetch_count': getattr(qos, 'value', None),
+            'queues': {},
+        }
+    return info()
+
+
+@control_command(
+    args=[('queue', str), ('limit', int)],
+    signature='<queue> [limit]',
+)
+def set_queue_prefetch(state, queue=None, limit=None, **kwargs):
+    """Set, change or clear the per-queue prefetch cap of one queue.
+
+    Arguments:
+        queue (str): Name of the queue to adjust (alias accepted).
+        limit (int): New positive prefetch cap.  Pass ``None``/omit the
+            argument to clear a previously configured cap so the queue
+            follows the automatic value again.
+
+    An error is returned (rather than a fake success reply) when the
+    queue is not consumed, the value is illegal, the broker cannot
+    enforce per-consumer QoS, or the broker rejected the new window.
+    """
+    if not queue:
+        return nok("'queue' is required")
+    consumer = state.consumer
+    try:
+        report = consumer.set_queue_prefetch_limit(queue, limit)
+    except ValueError as exc:
+        logger.error('Refused queue prefetch change for %r: %s',
+                     queue, exc)
+        return nok(str(exc))
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.exception('Failed to apply queue prefetch change for %r',
+                         queue)
+        return nok(f'{type(exc).__name__}: {exc}')
+    return ok(report)

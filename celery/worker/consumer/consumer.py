@@ -33,6 +33,9 @@ from celery.utils.text import truncate
 from celery.utils.threads import bound_open_broker_sockets
 from celery.utils.time import humanize_seconds, rate
 from celery.worker import loops
+from celery.worker.consumer.qos import (
+    validate_queue_prefetch_limit, validate_queue_prefetch_limits,
+)
 from celery.worker.state import (active_requests, maybe_shutdown, requests, reserved_requests, scheduled_requests,
                                  successful_requests, task_reserved)
 
@@ -216,6 +219,14 @@ class Consumer:
         self.disable_rate_limits = disable_rate_limits
         self.initial_prefetch_count = initial_prefetch_count
         self.prefetch_multiplier = prefetch_multiplier
+        # Per-queue prefetch caps declared via worker_queue_prefetch_limits.
+        # Validated here, during worker startup, so illegal values fail the
+        # boot instead of being silently ignored.  The same mapping is
+        # mutated in place by runtime adjustments and survives connection
+        # rebuilds and pool scaling.
+        self.queue_prefetch_limits = validate_queue_prefetch_limits(
+            self.app.conf.worker_queue_prefetch_limits
+        )
         self._maximum_prefetch_restored = True
         # Effective QoS mode, recorded by the Tasks bootstep once the
         # connection is established. ``None`` means "unknown" and preserves
@@ -320,6 +331,11 @@ class Consumer:
         self.initial_prefetch_count = (
             self.pool.num_processes * self.prefetch_multiplier
         )
+        if self._per_queue_prefetch:
+            # Recompute per-queue targets from the new automatic value;
+            # configured caps are inputs to the recompute and survive it.
+            self.qos.recompute()
+            return
         return self._update_qos_eventually(index)
 
     def _update_qos_eventually(self, index):
@@ -360,7 +376,7 @@ class Consumer:
         return self._schedule_bucket_request(bucket)
 
     def _limit_post_eta(self, request, bucket, tokens):
-        self.qos.decrement_eventually()
+        self._decrement_qos(request.message)
         bucket.add((request, tokens))
         return self._schedule_bucket_request(bucket)
 
@@ -455,7 +471,12 @@ class Consumer:
             # ``_restore_prefetch_count_after_connection_restart`` is a no-op
             # and the worker would stay stuck at the reduced count after one
             # reconnect. Skip the reduction entirely in that mode. See #9512.
-            if self.qos_global is False:
+            # Per-queue prefetch mode also speaks per-consumer QoS, but its
+            # targets are (re)applied by cancelling/re-consuming consumers, so
+            # the reduction and gradual restoration work there even for
+            # quorum queues -- and the configured per-queue caps must not be
+            # reset by the skip branch.
+            if self.qos_global is False and not self.queue_prefetch_limits:
                 # Also clear any reduced state left over from an earlier
                 # reconnect that took the legacy path (e.g. before
                 # ``Tasks.start()`` had a chance to record ``qos_global``).
@@ -671,20 +692,203 @@ class Consumer:
                                   routing_key=routing_key, **options)
         if not cset.consuming_from(queue):
             cset.add_queue(q)
-            cset.consume()
+            if self._per_queue_prefetch:
+                # Stage the queue's per-consumer QoS window before its
+                # basic.consume so it does not inherit a stale value.
+                prefetch_count = self.qos.activate_queue(q.name)
+                self.bind_queue_prefetch(q, prefetch_count)
+            else:
+                cset.consume()
             info('Started consuming from %s', queue)
 
     def cancel_task_queue(self, queue):
         info('Canceling queue %s', queue)
         queues = self.app.amqp.queues
         queues.deselect(queue)
-        self.task_consumer.cancel_by_queue(queues.aliases.get(queue, queue))
+        queue_name = queues.aliases.get(queue, queue)
+        self.task_consumer.cancel_by_queue(queue_name)
+        if self._per_queue_prefetch:
+            # Keep the configured cap (so re-adding the queue restores it)
+            # but drop live target/actual state for this consumer.
+            self.qos.deactivate_queue(queue_name)
+
+    # -- per-queue prefetch ------------------------------------------------
+
+    @property
+    def _per_queue_prefetch(self):
+        """:const:`True` when a per-queue-aware QoS manager is in effect."""
+        qos = getattr(self, 'qos', None)
+        return qos is not None and getattr(
+            qos, 'per_queue_enabled', False) is True
+
+    def enable_per_queue_qos(self):
+        """Configure the QoS manager for per-queue prefetch windows."""
+        # Share the consumer's own limits mapping so runtime adjustments
+        # survive pool scaling and connection rebuilds.
+        self.qos.configure(
+            auto_provider=lambda: self.initial_prefetch_count,
+            held_provider=self._held_prefetch_for_queue,
+            apply=self._apply_queue_qos,
+            limits=self.queue_prefetch_limits,
+        )
+
+    def bind_queue_prefetch(self, queue, prefetch_count,
+                            sync_consume=False):
+        """Apply a per-consumer QoS window and (re)consume one queue.
+
+        ``basic.qos`` is staged *before* the existing consumer (if any) is
+        cancelled, so a failure to set the window leaves the running
+        consumer untouched.  ``basic.cancel`` only stops new deliveries:
+        already prefetched, unacknowledged messages stay on the channel
+        with their delivery tags, so they remain acknowledgeable and are
+        neither lost nor duplicated.
+
+        Arguments:
+            queue (kombu.Queue): the queue object as held by the task
+                consumer.
+            prefetch_count (int): per-consumer prefetch window.
+            sync_consume (bool): wait for ``basic.consume-ok`` (used for
+                the last queue of the initial binding, mirroring
+                :meth:`kombu.Consumer.consume`).
+        """
+        task_consumer = self.task_consumer
+        channel = task_consumer.channel
+        # Per-consumer QoS only affects consumers created after this frame,
+        # so staging it first is harmless for the running consumer and
+        # makes the ordering failure-safe.
+        channel.basic_qos(0, prefetch_count, False)
+        tag = task_consumer._active_tags.pop(queue.name, None)
+        if tag is not None:
+            # Runtime rebinds happen while the broker drain loop is
+            # dispatching (remote control / event loop), so the cancel
+            # must not block waiting for ``basic.cancel-ok`` on the very
+            # same socket the drain loop would need to read it from.
+            channel.basic_cancel(tag, nowait=True)
+        try:
+            task_consumer._basic_consume(
+                queue, nowait=not sync_consume,
+            )
+        except Exception:
+            # The old consumer was already cancelled -- make one attempt to
+            # put a consumer back before surfacing the failure, otherwise
+            # the queue would silently stop receiving messages.
+            logger.exception(
+                'Failed to re-consume queue %r with prefetch_count=%s '
+                'after cancelling its consumer; retrying once.',
+                queue.name, prefetch_count,
+            )
+            task_consumer._basic_consume(queue, nowait=True)
+            raise
+
+    def _apply_queue_qos(self, queue_name, prefetch_count):
+        """QoS-manager callback: bind a new window to a running queue."""
+        task_consumer = self.task_consumer
+        queue = task_consumer._queues[queue_name]
+        self.bind_queue_prefetch(queue, prefetch_count)
+
+    def _held_prefetch_for_queue(self, queue):
+        """Count messages prefetched but not yet handed to the pool.
+
+        These are ETA-scheduled requests and requests waiting in
+        rate-limit token buckets.  Reserved/active requests already left
+        the consumer for the execution pool and are not counted.
+        """
+        qos = self.qos
+        held = 0
+        for request in tuple(scheduled_requests):
+            if qos.queue_of_message(request.message) == queue:
+                held += 1
+        for bucket in self.task_buckets.values():
+            if not bucket:
+                continue
+            for request, _tokens in tuple(bucket.contents):
+                if qos.queue_of_message(request.message) == queue:
+                    held += 1
+        return held
+
+    def set_queue_prefetch_limit(self, queue, limit):
+        """Set/clear one queue's prefetch cap at runtime.
+
+        Activates per-queue mode on demand when no caps were declared at
+        startup.  Raises :exc:`ValueError` (rather than pretending
+        success) when the value is illegal, the queue is not being
+        consumed or the broker refused the new window.
+
+        Returns:
+            dict: per-queue target/actual report for the queue.
+        """
+        if self.task_consumer is None or getattr(self, 'qos', None) is None:
+            raise ValueError('task consumer is not running')
+        queue_name = self.app.amqp.queues.aliases.get(queue, queue)
+        if queue_name not in self.task_consumer._queues:
+            raise ValueError(
+                f"worker is not consuming from queue {queue!r}"
+            )
+        if limit is not None:
+            # Raises ValueError on illegal values.
+            validate_queue_prefetch_limit(queue_name, limit)
+        if not self._per_queue_prefetch:
+            if limit is None:
+                raise ValueError(
+                    f"no per-queue prefetch limit is set for queue {queue!r}"
+                )
+            # Seed the persistent cap before switching so the initial
+            # per-queue binding applies the requested window immediately
+            # instead of binding the auto value and re-consuming again.
+            self.queue_prefetch_limits[queue_name] = limit
+            try:
+                self._switch_to_per_queue_qos()
+            except Exception:
+                # The broker never accepted the switch: don't leave the
+                # rejected target lying around in the persistent mapping.
+                self.queue_prefetch_limits.pop(queue_name, None)
+                raise
+            return self.qos.info()['queues'][queue_name]
+        if limit is None:
+            return self.qos.clear_limit(queue_name)
+        return self.qos.set_limit(queue_name, limit)
+
+    def _switch_to_per_queue_qos(self):
+        """Move a running legacy consumer to per-queue QoS windows."""
+        if self.connection.transport.driver_type != 'amqp':
+            raise ValueError(
+                "per-queue prefetch limits require an AMQP broker; "
+                f"current transport is "
+                f"{self.connection.transport.driver_type!r}"
+            )
+        if not self.initial_prefetch_count:
+            raise ValueError(
+                "per-queue prefetch limits cannot be enabled while "
+                "prefetch is disabled (worker_prefetch_multiplier=0)"
+            )
+        self.enable_per_queue_qos()
+        task_consumer = self.task_consumer
+        # Remove the legacy channel-global window (0 == unlimited) so it
+        # cannot silently clamp the new per-consumer windows.
+        task_consumer.channel.basic_qos(0, 0, True)
+        # Runtime switch happens inside the broker drain loop (remote
+        # control command), so all frames are fire-and-forget.
+        for queue in list(task_consumer.queues):
+            prefetch_count = self.qos.activate_queue(queue.name)
+            self.bind_queue_prefetch(queue, prefetch_count)
 
     def apply_eta_task(self, task):
         """Method called by the timer to apply a task with an ETA/countdown."""
         task_reserved(task)
         self.on_task_request(task)
+        self._decrement_qos(task.message)
+
+    def _decrement_qos(self, message):
+        """Return credit lent for a held (ETA/rate-limited) message.
+
+        ``decrement_eventually`` keeps the exact legacy call for the
+        global counter while ``note_return`` additionally attributes the
+        credit to the message's queue in per-queue mode (no-op legacy).
+        """
         self.qos.decrement_eventually()
+        note_return = getattr(self.qos, 'note_return', None)
+        if note_return is not None:
+            note_return(message)
 
     def _message_report(self, body, message):
         return MESSAGE_REPORT.format(dump_body(message, body),
@@ -753,6 +957,15 @@ class Consumer:
         call_soon_ack = self.call_soon_ack
 
         def on_task_received(message):
+            # Attribute the delivery to its source queue before any
+            # per-queue prefetch bookkeeping runs.  No-op unless the
+            # active QoS manager supports per-queue windows.
+            qos = getattr(self, 'qos', None)
+            bind_message = getattr(qos, 'bind_message', None)
+            if bind_message is not None and self.task_consumer is not None:
+                bind_message(
+                    message, self.task_consumer._active_tags,
+                )
             # payload will only be set for v1 protocol, since v2
             # will defer deserializing the message body to the pool.
             payload = None
@@ -817,9 +1030,20 @@ class Consumer:
             )):
                 return
 
-            new_prefetch_count = min(self.max_prefetch_count, self._new_prefetch_count)
-            self.qos.value = self.initial_prefetch_count = new_prefetch_count
-            self.qos.set(self.qos.value)
+            per_queue = getattr(self.qos, 'per_queue_enabled', False) is True
+            new_prefetch_count = min(
+                self.max_prefetch_count, self._new_prefetch_count,
+            )
+            self.initial_prefetch_count = new_prefetch_count
+            if per_queue:
+                # Recompute targets from the restored automatic value and
+                # rebind the affected queues.  Configured caps are inputs
+                # to the recompute and are never reset.
+                self.qos.recompute()
+                self.qos.flush()
+            else:
+                self.qos.value = new_prefetch_count
+                self.qos.set(self.qos.value)
 
             already_restored = self._maximum_prefetch_restored
             self._maximum_prefetch_restored = new_prefetch_count == self.max_prefetch_count
@@ -836,7 +1060,7 @@ class Consumer:
 
     @property
     def _new_prefetch_count(self):
-        return self.qos.value + self.prefetch_multiplier
+        return self.initial_prefetch_count + self.prefetch_multiplier
 
     def __repr__(self):
         """``repr(self)``."""
