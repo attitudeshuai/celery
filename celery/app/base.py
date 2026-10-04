@@ -970,6 +970,12 @@ class Celery:
                 'task_always_eager has no effect on send_task',
             ), stacklevel=2)
 
+        # Static routing gate for the client side: when enabled, every
+        # delivery validates against the current routing version first.
+        # No broker access; no-op (default) keeps delivery behavior
+        # unchanged.
+        amqp.check_routes()
+
         # If the caller did not supply a task_type (i.e. a plain
         # send_task("name", ...) call), look it up in the local registry
         # and apply its execution options as defaults.  We intentionally

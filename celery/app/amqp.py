@@ -1,5 +1,6 @@
 """Sending/Receiving Messages (Kombu integration)."""
 import numbers
+import threading
 from collections import namedtuple
 from collections.abc import Mapping
 from datetime import timedelta
@@ -11,14 +12,31 @@ from kombu.utils.functional import maybe_list
 from kombu.utils.objects import cached_property
 
 from celery import signals
+from celery.exceptions import RouteValidationError
 from celery.utils.nodenames import anon_nodename
 from celery.utils.saferepr import saferepr
 from celery.utils.text import indent as textindent
 from celery.utils.time import maybe_make_aware
 
+from . import route_checks
 from . import routes as _routes
 
 __all__ = ('AMQP', 'Queues', 'task_message')
+
+#: Configuration keys that feed the prepared routing table.
+_ROUTES_SETTING = 'task_routes'
+#: Configuration keys that change the declared queue set or the way
+#: missing queues are created, and therefore invalidate a static
+#: routing decision just like a ``task_routes`` change.
+_QUEUE_SETTINGS = frozenset({
+    'task_queues', 'task_create_missing_queues',
+    'task_create_missing_queue_type',
+    'task_create_missing_queue_exchange_type',
+    'task_queue_max_priority', 'task_default_queue',
+    'task_default_exchange', 'task_default_exchange_type',
+    'task_default_routing_key',
+})
+_ROUTING_SETTINGS = frozenset({_ROUTES_SETTING}) | _QUEUE_SETTINGS
 
 #: earliest date supported by time.mktime.
 INT_MIN = -2147483648
@@ -261,7 +279,20 @@ class AMQP:
             1: self.as_task_v1,
             2: self.as_task_v2,
         }
+        # Version boundary for routing decisions.  Only used when
+        # task_routes_validate is enabled; when the gate is disabled every
+        # code path behaves exactly as it did before (the lock is simply
+        # never taken).
+        self._routing_lock = threading.RLock()
+        #: Monotonic version of the (routing table, queue declarations)
+        #: snapshot.  Bumped whenever either is rebuilt.
+        self._rtable_version = 0
+        #: Cached static route report for ``_rtable_version``.
+        self._route_report = None
         self.app._conf.bind_to(self._handle_conf_update)
+
+    def _routing_validate_enabled(self):
+        return bool(self.app.conf.task_routes_validate)
 
     @cached_property
     def create_task_message(self):
@@ -313,7 +344,57 @@ class AMQP:
                                               create_missing), app=self.app)
 
     def flush_routes(self):
-        self._rtable = _routes.prepare(self.app.conf.task_routes)
+        """Rebuild the prepared routing table from ``task_routes``."""
+        if self._routing_validate_enabled():
+            with self._routing_lock:
+                self._rebuild_routing_locked(routes_changed=True)
+        else:
+            self._rtable = _routes.prepare(self.app.conf.task_routes)
+
+    def _rebuild_routing_locked(self, routes_changed=False,
+                                queues_changed=False):
+        """Atomically swap routing state and invalidate old decisions.
+
+        ``_routing_lock`` must be held by the caller.  The new routing
+        table and queue mapping are built before they are published, so a
+        concurrent reader either sees the complete old snapshot or the
+        complete new one -- never an intermediate state.  Previous
+        conclusions are dropped and the version is bumped before the new
+        state becomes visible, so stale results can never be served for a
+        new configuration.
+        """
+        if routes_changed or self._rtable is None:
+            rtable = _routes.prepare(self.app.conf.task_routes)
+        else:
+            rtable = self._rtable
+        new_queues = None
+        selected = None
+        if queues_changed:
+            old = self.__dict__.get('queues')
+            if old is not None and old._consume_from is not None:
+                # Preserve an active `worker -Q` subscription selection
+                # across the rebuild.
+                selected = list(old._consume_from)
+            new_queues = self.Queues(self.app.conf.task_queues)
+            for attrname in ('default_queue', 'default_exchange'):
+                self.__dict__.pop(attrname, None)
+            # Invalidate first: nothing between this point and the swap
+            # may answer with conclusions derived from the old snapshot.
+            self._route_report = None
+            self._rtable_version += 1
+        else:
+            self._route_report = None
+            self._rtable_version += 1
+        self._rtable = rtable
+        if new_queues is not None:
+            self.__dict__['queues'] = new_queues
+            if selected is not None:
+                new_queues.select(selected)
+        self.__dict__.pop('router', None)
+
+    def _ensure_routing_locked(self):
+        if self._rtable is None:
+            self._rebuild_routing_locked(routes_changed=True)
 
     def TaskConsumer(self, channel, queues=None, accept=None, **kw):
         if accept is None:
@@ -617,20 +698,49 @@ class AMQP:
 
     @queues.setter
     def queues(self, queues):
-        return self.Queues(queues)
+        new_queues = self.Queues(queues)
+        if self._routing_validate_enabled():
+            with self._routing_lock:
+                self.__dict__['queues'] = new_queues
+                self.__dict__.pop('default_queue', None)
+                self._route_report = None
+                self._rtable_version += 1
+                self.__dict__.pop('router', None)
+        return new_queues
 
     @property
     def routes(self):
+        if self._routing_validate_enabled():
+            with self._routing_lock:
+                self._ensure_routing_locked()
+                return self._rtable
         if self._rtable is None:
             self.flush_routes()
         return self._rtable
 
-    @cached_property
+    @property
     def router(self):
-        return self.Router()
+        # Mirrors cached_property semantics when the gate is disabled: the
+        # first Router() built for a snapshot is reused until a routing
+        # setting changes.
+        cached = self.__dict__.get('router')
+        if cached is not None:
+            return cached
+        if self._routing_validate_enabled():
+            with self._routing_lock:
+                cached = self.__dict__.get('router')
+                if cached is None:
+                    self._ensure_routing_locked()
+                    cached = self.Router()
+                    self.__dict__['router'] = cached
+                return cached
+        cached = self.Router()
+        self.__dict__['router'] = cached
+        return cached
 
     @router.setter
     def router(self, value):
+        self.__dict__['router'] = value
         return value
 
     @property
@@ -658,7 +768,130 @@ class AMQP:
         return self.app.events.Dispatcher(enabled=False)
 
     def _handle_conf_update(self, *args, **kwargs):
-        if ('task_routes' in kwargs or 'task_routes' in args):
+        changed = set(kwargs)
+        for arg in args:
+            # conf.update(mapping) forwards the mapping positionally.
+            if isinstance(arg, Mapping):
+                changed.update(arg)
+            else:
+                changed.add(arg)
+        if self._routing_validate_enabled():
+            relevant = changed & _ROUTING_SETTINGS
+            if relevant:
+                with self._routing_lock:
+                    self._rebuild_routing_locked(
+                        routes_changed=_ROUTES_SETTING in relevant,
+                        queues_changed=bool(relevant & _QUEUE_SETTINGS),
+                    )
+            return
+        # Gate disabled: keep the historical behavior of only reacting to
+        # task_routes changes.
+        if _ROUTES_SETTING in changed:
             self.flush_routes()
             self.router = self.Router()
-        return
+
+    @staticmethod
+    def _stable_copy(mapping):
+        """Copy a mapping that may grow while a send auto-creates a queue.
+
+        ``Router.route()`` can add a missing queue to the live mapping
+        without going through a configuration update.  Copying such a
+        mapping concurrently may raise ``RuntimeError: dictionary changed
+        size``; retrying yields the strictly more complete state instead
+        of an intermediate one.
+        """
+        while True:
+            try:
+                return dict(mapping)
+            except RuntimeError:
+                continue
+
+    def _routing_snapshot_locked(self):
+        """Build a consistent, broker-free snapshot for static analysis."""
+        self._ensure_routing_locked()
+        conf = self.app.conf
+        queues = self.queues
+        declared = self._stable_copy(queues)
+        consume_from = set(self._stable_copy(queues.consume_from))
+        if declared:
+            implicit_default = None
+        else:
+            # Reproduce the queue the app creates implicitly when no
+            # task_queues are configured, without touching the live set.
+            implicit_default = self.Queues(())[conf.task_default_queue]
+        task_names = list(self.app.tasks.keys())
+        task_options = {}
+        for name in task_names:
+            task = self.app.tasks[name]
+            get_options = getattr(task, '_get_exec_options', None)
+            if callable(get_options):
+                try:
+                    options = get_options() or {}
+                except Exception:  # pragma: no cover
+                    options = {}
+                task_options[name] = {
+                    key: value for key, value in options.items()
+                    if value is not None and key in (
+                        'queue', 'exchange', 'routing_key')
+                }
+        return {
+            'version': self._rtable_version,
+            'prepared_routes': self._rtable,
+            'queues': declared,
+            'missing_factory': queues.new_missing,
+            'consume_from': consume_from,
+            'task_names': task_names,
+            'task_options': task_options,
+            'create_missing': queues.create_missing,
+            'create_missing_queue_type': queues.create_missing_queue_type,
+            'create_missing_queue_exchange_type':
+                queues.create_missing_queue_exchange_type,
+            'default_queue_name': conf.task_default_queue,
+            'implicit_default_queue': implicit_default,
+        }
+
+    def inspect_routes(self):
+        """Return a static report for the current routing configuration.
+
+        Purely introspective: never connects to a broker, never declares
+        queues and never publishes messages.  When the gate is enabled the
+        report is cached per routing version and recomputed after every
+        routing-relevant configuration change.
+        """
+        if self._routing_validate_enabled():
+            with self._routing_lock:
+                return self._inspect_routes_locked()
+        return self._inspect_routes_locked()
+
+    def _inspect_routes_locked(self):
+        report = self._route_report
+        if report is not None and report.version == self._rtable_version:
+            return report
+        report = route_checks.inspect_routing(
+            **self._routing_snapshot_locked())
+        if self._routing_validate_enabled():
+            self._route_report = report
+        return report
+
+    def check_routes(self):
+        """Validate routing configuration before anything is delivered.
+
+        No-op when :setting:`task_routes_validate` is disabled (the
+        default), keeping startup and delivery behavior unchanged.
+        Otherwise:
+
+        * evaluates all rules against the current routing snapshot without
+          connecting to the broker, declaring queues or publishing;
+        * raises :exc:`~celery.exceptions.RouteValidationError` if a rule
+          cannot be resolved;
+        * returns the cached :class:`~celery.app.route_checks.RouteReport`
+          otherwise, recomputing it after a hot configuration update.
+        """
+        if not self._routing_validate_enabled():
+            return None
+        with self._routing_lock:
+            report = self._inspect_routes_locked()
+            if report.errors:
+                raise RouteValidationError(
+                    route_checks.format_errors(report))
+            return report

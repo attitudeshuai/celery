@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 from amqp import ChannelError
-from kombu import Connection
+from kombu import Connection, Queue
 from kombu.asynchronous import get_event_loop
 from kombu.common import QoS, ignore_errors
 from kombu.transport.base import Message
@@ -22,8 +22,8 @@ import t.skip
 from celery.apps.worker import safe_say
 from celery.bootsteps import CLOSE, RUN, TERMINATE, StartStopStep
 from celery.concurrency.base import BasePool
-from celery.exceptions import (ImproperlyConfigured, InvalidTaskError, TaskRevokedError, WorkerShutdown,
-                               WorkerTerminate)
+from celery.exceptions import (ImproperlyConfigured, InvalidTaskError, RouteValidationError, TaskRevokedError,
+                               WorkerShutdown, WorkerTerminate)
 from celery.platforms import EX_FAILURE
 from celery.utils.nodenames import worker_direct
 from celery.utils.serialization import pickle
@@ -1392,6 +1392,59 @@ class test_WorkController(ConsumerCase):
         with patch("celery.worker.worker.sleep") as sleep:
             worker.wait_for_soft_shutdown()
             sleep.assert_not_called()
+
+
+class test_WorkerRoutingGate:
+    """Startup routing gate (task_routes_validate)."""
+
+    def _reset(self):
+        app = self.app
+        app.conf.task_routes_validate = False
+        app.conf.task_create_missing_queues = True
+        app.conf.update(task_routes=None)
+        app.conf.task_queues = (Queue('testcelery',
+                                      routing_key='testcelery'),)
+        app.amqp.__dict__.pop('queues', None)
+        app.amqp._rtable = None
+        app.amqp._route_report = None
+        app.amqp._rtable_version = 0
+        app.amqp.__dict__.pop('router', None)
+
+    def setup_method(self, method=None):
+        self._reset()
+
+    def teardown_method(self, method=None):
+        self._reset()
+
+    def test_disabled_gate_does_not_change_startup(self):
+        worker = self.app.WorkController(concurrency=1, loglevel=0)
+        worker.blueprint.shutdown_complete.set()
+        assert worker.validate_task_routes() is None
+        assert self.app.amqp._route_report is None
+
+    def test_gate_fails_before_broker_connection(self):
+        self.app.conf.task_routes_validate = True
+        self.app.conf.task_create_missing_queues = False
+        self.app.conf.update(
+            task_routes={'startup.gate.task': 'undeclared-queue'})
+        with patch.object(self.app, 'connection_for_read',
+                          side_effect=AssertionError('broker was connected')):
+            with pytest.raises(RouteValidationError) as exc_info:
+                self.app.WorkController(concurrency=1, loglevel=0)
+        assert 'undeclared-queue' in str(exc_info.value)
+
+    def test_gate_passes_with_valid_routes(self):
+        self.app.conf.task_routes_validate = True
+        self.app.conf.task_create_missing_queues = False
+        self.app.conf.update(
+            task_routes={'startup.gate.task': 'testcelery'})
+        worker = self.app.WorkController(concurrency=1, loglevel=0)
+        worker.blueprint.shutdown_complete.set()
+        report = self.app.amqp._route_report
+        assert report is not None and not report.errors
+        # The rule name need not be registered locally; its target is
+        # covered by the per-rule reachability conclusions regardless.
+        assert 'testcelery' in report.reachable
 
 
 class test_WorkerApp:

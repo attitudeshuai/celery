@@ -309,6 +309,7 @@ NAMESPACES = Namespace(
         remote_tracebacks=Option(False, type='bool'),
         repr_maxlevels=Option(3, type='int'),
         routes=Option(type='any'),
+        routes_validate=Option(False, type='bool'),
         send_sent_event=Option(
             False, type='bool', old={'celery_send_task_sent_event'},
         ),

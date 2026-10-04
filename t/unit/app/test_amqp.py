@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from threading import Barrier, Thread
 from unittest.mock import Mock, patch
 
 import pytest
@@ -6,6 +7,7 @@ from kombu import Exchange, Queue
 
 from celery import uuid
 from celery.app.amqp import Queues, utf8dict
+from celery.exceptions import ImproperlyConfigured, RouteValidationError
 from celery.utils.time import to_utc
 
 
@@ -596,3 +598,190 @@ class test_as_task_v2(test_AMQP_Base):
         assert embed['callbacks'] == [utf8dict(t.s(1)), utf8dict(t.s(2))]
         assert embed['errbacks'] == [utf8dict(t.s(3)), utf8dict(t.s(4))]
         assert embed['chord'] == utf8dict(t.s(5))
+
+
+class test_route_validation_gate:
+    """Startup gate, versioned invalidation and hot-update behavior."""
+
+    def _reset(self, validate=False, routes=None, create_missing=None):
+        app = self.app
+        app.conf.task_routes_validate = validate
+        app.conf.update(task_routes=routes)
+        if create_missing is not None:
+            app.conf.task_create_missing_queues = create_missing
+        app.amqp._rtable = None
+        app.amqp._route_report = None
+        app.amqp._rtable_version = 0
+        app.amqp.__dict__.pop('router', None)
+
+    def teardown_method(self):
+        app = self.app
+        app.conf.task_routes_validate = False
+        app.conf.update(task_routes=None)
+        app.conf.task_create_missing_queues = True
+        app.conf.task_queues = (Queue('testcelery',
+                                      routing_key='testcelery'),)
+        app.amqp.__dict__.pop('queues', None)
+        self._reset()
+
+    def test_disabled_by_default(self):
+        assert self.app.conf.task_routes_validate is False
+        assert self.app.amqp.check_routes() is None
+
+    def test_inspect_is_available_without_gate(self):
+        report = self.app.amqp.inspect_routes()
+        assert report is not None
+        # Disabled mode does not cache conclusions across versions.
+        assert self.app.amqp._route_report is None
+
+    def test_inspect_does_not_create_queues_or_touch_broker(self):
+        self._reset(validate=True,
+                    routes={'t.something': 'ghost-queue'},
+                    create_missing=True)
+        amqp = self.app.amqp
+        assert amqp._producer_pool is None
+        report = amqp.inspect_routes()
+        assert 'ghost-queue' in {q.name for q in report.auto_queues}
+        # Static analysis must not register the queue as declared...
+        assert 'ghost-queue' not in amqp.queues
+        # ...and must not have opened a producer pool.
+        assert amqp._producer_pool is None
+
+    def test_check_routes_raises_on_undeclared_queue(self):
+        self._reset(validate=True,
+                    routes={'t.something': 'ghost-queue'},
+                    create_missing=False)
+        with pytest.raises(RouteValidationError) as exc_info:
+            self.app.amqp.check_routes()
+        assert isinstance(exc_info.value, ImproperlyConfigured)
+        assert 'ghost-queue' in str(exc_info.value)
+
+    def test_check_routes_passes_for_valid_config(self):
+        self._reset(validate=True,
+                    routes={'t.something': 'testcelery'},
+                    create_missing=False)
+        report = self.app.amqp.check_routes()
+        assert report is not None and not report.errors
+
+    def test_report_is_cached_per_version(self):
+        self._reset(validate=True, routes={'t.x': 'testcelery'},
+                    create_missing=False)
+        amqp = self.app.amqp
+        first = amqp.inspect_routes()
+        assert amqp.inspect_routes() is first
+        version = amqp._rtable_version
+
+        self.app.conf.update(task_routes={'t.y': 'testcelery'})
+        assert amqp._rtable_version > version
+        assert amqp.inspect_routes() is not first
+
+    def test_task_routes_update_rebuilds_live_router(self):
+        self._reset(validate=True, routes={'t.x': 'testcelery'},
+                    create_missing=True)
+        amqp = self.app.amqp
+        assert amqp.router.route({}, 't.x')['queue'].name == 'testcelery'
+
+        self.app.conf.update(task_routes={'t.x': 'hot-queue'})
+        assert amqp.router.route({}, 't.x')['queue'].name == 'hot-queue'
+
+    def test_task_queues_update_invalidates_conclusions(self):
+        self._reset(validate=True, routes={'t.x': 'late-queue'},
+                    create_missing=True)
+        amqp = self.app.amqp
+        assert 'late-queue' in {q.name for q in amqp.inspect_routes().auto_queues}
+
+        self.app.conf.update(task_queues=(
+            Queue('testcelery', routing_key='testcelery'),
+            Queue('late-queue', routing_key='late-queue'),
+        ))
+        report = amqp.inspect_routes()
+        assert 'late-queue' not in {q.name for q in report.auto_queues}
+
+    def test_unrelated_update_keeps_version(self):
+        self._reset(validate=True, routes={'t.x': 'testcelery'},
+                    create_missing=False)
+        amqp = self.app.amqp
+        report = amqp.inspect_routes()
+        version = amqp._rtable_version
+        self.app.conf.update(task_serializer='pickle')
+        assert amqp._rtable_version == version
+        assert amqp.inspect_routes() is report
+
+    def test_queues_assignment_invalidates(self):
+        self._reset(validate=True)
+        amqp = self.app.amqp
+        version = amqp._rtable_version
+        amqp.queues = [Queue('testcelery', routing_key='testcelery')]
+        assert amqp._rtable_version > version
+        assert amqp._route_report is None
+
+    def test_send_task_blocked_before_publish(self):
+        self._reset(validate=True,
+                    routes={'t.something': 'ghost-queue'},
+                    create_missing=False)
+        producer = Mock(name='producer')
+        with pytest.raises(RouteValidationError):
+            self.app.send_task('t.something', producer=producer)
+        producer.publish.assert_not_called()
+
+    def test_send_task_passes_gate_and_publishes(self):
+        self._reset(validate=True, routes=None, create_missing=False)
+        # Default testcelery queue is declared in the suite config.
+        result = self.app.send_task('t.gated_task')
+        assert result is not None
+
+    def test_concurrent_updates_and_checks_never_see_intermediate_state(self):
+        self._reset(validate=True, routes={'t.x': 'qa'},
+                    create_missing=True)
+        amqp = self.app.amqp
+        configs = (
+            {'t.x': 'qa'},
+            {'t.x': 'qb'},
+        )
+        barrier = Barrier(6)
+        errors = []
+
+        def updater():
+            try:
+                barrier.wait()
+                for _ in range(100):
+                    self.app.conf.update(
+                        task_routes=configs[_ % len(configs)])
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def reader():
+            try:
+                barrier.wait()
+                for _ in range(200):
+                    report = amqp.inspect_routes()
+                    assert report.version >= 1
+                    # A snapshot only ever contains one rule for t.x; it
+                    # can never imply both qa and qb at once.
+                    names = {q.name for q in report.auto_queues}
+                    assert not ({'qa', 'qb'} <= names)
+                    target = amqp.router.route({}, 't.x')['queue'].name
+                    assert target in ('qa', 'qb')
+                    check = amqp.check_routes()
+                    assert check is not None and not check.errors
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [Thread(target=updater) for _ in range(2)]
+        threads += [Thread(target=reader) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert not errors
+
+    def test_legacy_mode_only_reacts_to_task_routes(self):
+        self._reset(validate=False, routes={'t.x': 'testcelery'},
+                    create_missing=False)
+        amqp = self.app.amqp
+        router_before = amqp.router
+        # task_queues changes do not rebuild anything historically.
+        self.app.conf.update(task_serializer='json')
+        assert amqp.router is router_before
+        self.app.conf.update(task_routes={'t.x': 'testcelery'})
+        assert amqp.router is not router_before

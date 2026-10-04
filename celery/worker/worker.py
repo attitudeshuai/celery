@@ -23,6 +23,7 @@ from kombu.utils.compat import detect_environment
 from celery import bootsteps
 from celery import concurrency as _concurrency
 from celery import signals
+from celery.app.route_checks import format_report as format_route_report
 from celery.bootsteps import RUN, TERMINATE
 from celery.exceptions import ImproperlyConfigured, TaskRevokedError, WorkerTerminate
 from celery.platforms import EX_FAILURE, create_pidlock
@@ -104,6 +105,12 @@ class WorkController:
         self.pidfile = pidfile
         self.setup_queues(queues, exclude_queues)
         self.setup_includes(str_to_list(include))
+
+        # Startup routing gate: runs after -Q selection and task imports,
+        # but before bootsteps are applied and before the broker connection
+        # is established or any task is published.  No-op unless
+        # task_routes_validate is enabled.
+        self.validate_task_routes()
 
         # Set default concurrency
         if not self.concurrency:
@@ -191,6 +198,34 @@ class WorkController:
         task_modules = {task.__class__.__module__
                         for task in self.app.tasks.values()}
         self.app.conf.include = tuple(set(prev) | task_modules)
+
+    def validate_task_routes(self):
+        """Run the static routing gate before the worker starts delivering.
+
+        Only active with :setting:`task_routes_validate`.  Evaluates every
+        configured rule once, emits the per-rule report and raises if a
+        rule cannot be resolved -- failing startup before a broker
+        connection is opened or any message is published.  The analysis is
+        static: no queues are declared and no messages are sent.
+        """
+        if not self.app.conf.task_routes_validate:
+            return
+        # Flush pending @task decorators so all registered task names take
+        # part in the static analysis; the worker finalizes the app a few
+        # steps later during startup anyway.
+        self.app.finalize()
+        report = self.app.amqp.check_routes()
+        logger.info('\n%s', format_route_report(report))
+        finding_count = (
+            len(report.mismatches) + len(report.shadowed)
+            + len(report.unmatched) + len(report.ineffective)
+            + len(report.undecidable)
+            + len(report.subscription_diff.reachable_only)
+            + len(report.subscription_diff.subscribed_only))
+        if finding_count:
+            logger.warning(
+                'Task routing validation found %d non-fatal finding(s); '
+                'see the [task routing gate] report above.', finding_count)
 
     def prepare_args(self, **kwargs):
         return kwargs

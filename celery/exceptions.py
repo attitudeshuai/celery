@@ -68,7 +68,7 @@ __all__ = (
 
     # Core errors
     'CeleryError',
-    'ImproperlyConfigured', 'SecurityError',
+    'ImproperlyConfigured', 'RouteValidationError', 'SecurityError',
 
     # Kombu (messaging) errors.
     'OperationalError',
@@ -211,6 +211,16 @@ class Reject(TaskPredicate):
 
 class ImproperlyConfigured(CeleryError):
     """Celery is somehow improperly configured."""
+
+
+class RouteValidationError(ImproperlyConfigured):
+    """Static validation of the task routing configuration failed.
+
+    Raised before any message is published, when the startup routing gate
+    enabled via :setting:`task_routes_validate` finds a rule that cannot be
+    resolved statically (e.g. it targets a queue that is neither declared
+    in ``task_queues`` nor auto-creatable).
+    """
 
 
 class SecurityError(CeleryError):
