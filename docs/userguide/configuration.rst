@@ -1041,6 +1041,93 @@ on backend specifications).
     When using the database or filesystem backend, ``celery beat`` must be
     running for the results to be expired.
 
+.. setting:: result_governance_enabled
+
+``result_governance_enabled``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: ``False``
+
+Enables storage-side capacity governance for key/value result backends
+(Redis, filesystem and the in-memory cache backend).  It is fully opt-in:
+while disabled, the read and write paths behave exactly as before and
+governance issues no extra commands against the store.
+
+When enabled it adds three mechanisms on top of :setting:`result_expires`:
+
+* per final-state retention tiers
+  (:setting:`result_governance_retention`),
+* hard count and byte ceilings
+  (:setting:`result_governance_max_results` /
+  :setting:`result_governance_max_bytes`) enforced by evicting the oldest
+  ready results,
+* a read-only inventory (``backend.inspect_results()``) and a manual
+  cleanup entry point (``backend.cleanup_results()``).
+
+Results that have not reached a final state, results belonging to a group
+whose group metadata is still present in the store, and chord
+counter/unlock keys are never evicted.  Whether a group is still active is
+decided solely from the group metadata in the store, never from in-memory
+state.  Backends that cannot enumerate their keys (e.g. memcached) reject
+this setting at startup.
+
+.. setting:: result_governance_retention
+
+``result_governance_retention``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`None` (no state specific retention)
+
+A mapping of final task state (``SUCCESS``, ``FAILURE``, ``REVOKED``) to a
+retention time in seconds (int/float) or as a :class:`~datetime.timedelta`::
+
+    result_governance_enabled = True
+    result_governance_retention = {
+        'SUCCESS': timedelta(minutes=30),
+        'FAILURE': timedelta(days=30),
+        'REVOKED': timedelta(days=7),
+    }
+
+Only ready results older than their tier are removed by
+``celery.backend_cleanup`` / ``backend.cleanup_results()``.  States absent
+from the mapping are not removed by tier retention (storage native expiry
+from :setting:`result_expires` still applies unchanged).  Unknown states
+and negative values are rejected at startup.
+
+.. setting:: result_governance_max_results
+
+``result_governance_max_results``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`None` (unlimited)
+
+Hard ceiling on the number of task results kept in the store.  Once the
+ceiling is exceeded, the oldest ready, non-protected results are evicted
+after each write.  Configuring this without
+:setting:`result_governance_max_bytes` is sufficient: exceeding either
+configured dimension triggers eviction.  A value of ``0`` stops new
+results from being written (they read back as ``PENDING``); negative or
+non-integer values are rejected at startup.
+
+.. setting:: result_governance_max_bytes
+
+``result_governance_max_bytes``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Default: :const:`None` (unlimited)
+
+Hard ceiling on the total bytes occupied by stored task result payloads.
+Semantics mirror :setting:`result_governance_max_results`; ``0`` stops new
+results from being written.
+
+Governance tuning knobs live in
+:setting:`result_backend_transport_options`:
+``governance_scan_interval`` (own writes between resync scans, default
+100), ``governance_scan_count`` (Redis ``SCAN COUNT`` hint, default 500),
+``governance_mget_batch`` / ``governance_delete_batch`` (batch sizes),
+and ``governance_lock_timeout`` / ``governance_lock_ttl`` for the
+cross-process cleanup lock.
+
 .. setting:: result_cache_max
 
 ``result_cache_max``

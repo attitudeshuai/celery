@@ -6,10 +6,12 @@
     using K/V semantics like _get and _put.
 """
 import sys
+import threading
 import time
 import warnings
 from collections import deque, namedtuple
-from datetime import timedelta
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from functools import partial
 from uuid import UUID
 from weakref import WeakValueDictionary
@@ -27,6 +29,10 @@ import celery.exceptions
 from celery import current_app, group, maybe_signature, states
 from celery._state import get_current_task
 from celery.app.task import Context
+from celery.backends.governance import (E_GOVERNANCE_DISABLED, E_GOVERNANCE_UNSUPPORTED, CleanupFilters,
+                                        CleanupReport, ResultInventory, ResultInventoryItem, ScannedValue,
+                                        StateUsage, StoredResult, coerce_time_window, normalize_value_set,
+                                        parse_date_done, prepare_capacity_limit, prepare_retention_policy)
 from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
                                NotRegistered, SecurityError, TaskRevokedError, TimeoutError)
 from celery.result import GroupResult, ResultBase, ResultSet, allow_join_result, result_from_tuple
@@ -1098,12 +1104,20 @@ class BaseKeyValueStoreBackend(Backend):
     chord_keyprefix = 'chord-unlock-'
     implements_incr = False
 
+    #: Set to true by backends that can enumerate their own result keys,
+    #: which is what storage-side capacity governance relies on.
+    supports_capacity_governance = False
+
+    #: Name (under the keyprefixes) of the cross-process governance lock.
+    governance_lock_suffix = 'celery-governance-lock'
+
     def __init__(self, *args, **kwargs):
         if hasattr(self.key_t, '__func__'):  # pragma: no cover
             self.key_t = self.key_t.__func__  # remove binding
         super().__init__(*args, **kwargs)
         self._add_global_keyprefix()
         self._encode_prefixes()
+        self._init_governance()
         if self.implements_incr:
             self.apply_chord = self._apply_chord_incr
 
@@ -1263,6 +1277,11 @@ class BaseKeyValueStoreBackend(Backend):
                                      traceback=traceback, request=request)
         meta['task_id'] = bytes_to_str(task_id)
 
+        # Storage-side capacity governance is opt-in; when it is disabled the
+        # write path is byte-for-byte the legacy one below.
+        if self.governance_enabled:
+            return self._store_result_governed(task_id, state, meta)
+
         # Retrieve metadata from the backend, if the status
         # is a success then we ignore any following update to the state.
         # This solves a task deduplication issue because of network
@@ -1281,13 +1300,57 @@ class BaseKeyValueStoreBackend(Backend):
 
         return result
 
+    def _store_result_governed(self, task_id, state, meta):
+        """Write path used when storage-side capacity governance is enabled."""
+        key = self.get_key_for_task(task_id)
+        current_raw = self.get(key)
+        is_new = not current_raw
+        if current_raw:
+            # Keep the same SUCCESS-is-terminal guarantee as the legacy path,
+            # reading the value straight from the store (no cache markers).
+            try:
+                if self.decode_result(current_raw)['status'] == states.SUCCESS:
+                    return meta['result']
+            except Exception:  # pylint: disable=broad-except
+                # An unreadable value is treated as absent so it can be healed.
+                is_new = True
+                current_raw = None
+        elif not self._governance_allows_new_result(state):
+            # A capacity ceiling of 0 stops new results from being written;
+            # readers then observe the task as still PENDING.
+            logger.info(
+                'Result capacity ceiling is 0, dropping new result for '
+                'task %r (state %r)', task_id, state,
+            )
+            return meta['result']
+
+        payload = self.encode(meta)
+        new_size = self._payload_size(payload)
+        old_size = self._payload_size(current_raw) if current_raw else 0
+        try:
+            self._set_with_state(key, payload, state)
+        except BackendStoreError as ex:
+            raise BackendStoreError(str(ex), state=state, task_id=task_id) from ex
+
+        self._governance_note_write(
+            is_new=is_new, delta_bytes=new_size - old_size)
+        self._maybe_enforce_capacity_after_write()
+        return meta['result']
+
     def _save_group(self, group_id, result):
         self._set_with_state(self.get_key_for_group(group_id),
                              self.encode({'result': result.as_tuple()}), states.SUCCESS)
         return result
 
     def _delete_group(self, group_id):
-        self.delete(self.get_key_for_group(group_id))
+        # Removing the group metadata is what turns an unfinished group into
+        # a finished one; serialize it with governance cleanup so a cleanup
+        # can never observe a half-finished chord completion.
+        if self.governance_enabled:
+            with self._governance_storage_lock():
+                self.delete(self.get_key_for_group(group_id))
+        else:
+            self.delete(self.get_key_for_group(group_id))
 
     def _get_task_meta_for(self, task_id):
         """Get task meta-data for a task by id."""
@@ -1323,6 +1386,506 @@ class BaseKeyValueStoreBackend(Backend):
             result = meta['result']
             meta['result'] = result_from_tuple(result, self.app)
             return meta
+
+    # ------------------------------------------------------------------
+    # Storage-side capacity governance
+    # ------------------------------------------------------------------
+    #
+    # Everything in this block is opt-in via
+    # ``result_governance_enabled``.  It works purely from data that
+    # exists in the store itself: task meta keys are enumerated by the
+    # backend, and a result is considered protected by an unfinished
+    # group only while that group's metadata key is present in the
+    # store.  No in-memory markers or caller identifiers are involved.
+
+    def _init_governance(self):
+        """Read and validate the governance configuration at startup."""
+        conf = self.app.conf
+        self.governance_enabled = bool(
+            conf.get('result_governance_enabled', False))
+        self._governance_thread_lock = threading.RLock()
+        # Estimate of store occupancy since the last full scan; the next
+        # scan corrects drift caused by other processes and storage native
+        # key expiry.  Keeping this estimate makes the common (below cap)
+        # write path touch only local state.
+        self._governance_observed = None
+        self._governance_pending = 0
+        self._governance_pending_bytes = 0
+        self.governance_retention = {}
+        self.governance_max_results = None
+        self.governance_max_bytes = None
+        if not self.governance_enabled:
+            return
+        if not self.supports_capacity_governance:
+            raise ImproperlyConfigured(E_GOVERNANCE_UNSUPPORTED.format(
+                backend=type(self).__name__))
+        self.governance_retention = prepare_retention_policy(
+            conf.get('result_governance_retention'))
+        self.governance_max_results = prepare_capacity_limit(
+            conf.get('result_governance_max_results'),
+            'result_governance_max_results')
+        self.governance_max_bytes = prepare_capacity_limit(
+            conf.get('result_governance_max_bytes'),
+            'result_governance_max_bytes')
+        self._validate_governance_backend()
+
+    def _validate_governance_backend(self):
+        """Hook for backends unable to govern every transport they wrap."""
+
+    def _governance_option(self, name, default):
+        options = self.app.conf.get('result_backend_transport_options') or {}
+        return options.get(name, default)
+
+    def _governance_allows_new_result(self, state):
+        # A ceiling of 0 on either dimension stops every new result key.
+        return (self.governance_max_results != 0
+                and self.governance_max_bytes != 0)
+
+    def _governance_note_write(self, is_new, delta_bytes):
+        if is_new:
+            self._governance_pending += 1
+        self._governance_pending_bytes += delta_bytes
+
+    def _maybe_enforce_capacity_after_write(self):
+        # A ceiling of 0 is the "stop writing new results" switch; it does
+        # not retroactively empty the store on the write path.
+        positive_results = (self.governance_max_results is not None
+                            and self.governance_max_results > 0)
+        positive_bytes = (self.governance_max_bytes is not None
+                          and self.governance_max_bytes > 0)
+        if not positive_results and not positive_bytes:
+            return
+        interval = max(1, int(self._governance_option(
+            'governance_scan_interval', 100)))
+        if self._governance_observed is not None:
+            observed_count, observed_bytes = self._governance_observed
+            estimated_count = observed_count + self._governance_pending
+            estimated_bytes = observed_bytes + self._governance_pending_bytes
+            within = True
+            if positive_results \
+                    and estimated_count > self.governance_max_results:
+                within = False
+            if positive_bytes \
+                    and estimated_bytes > self.governance_max_bytes:
+                within = False
+            # Still resync periodically so other writers and storage
+            # native expirations get accounted for.
+            if within and self._governance_pending < interval:
+                return
+        self.enforce_result_capacity()
+
+    @contextmanager
+    def _governance_storage_lock(self):
+        """Serialize governance runs.
+
+        The base implementation only serializes threads within a process;
+        backends with a shared store override this with a lock that lives
+        in the store itself, so a cleanup on one worker cannot interleave
+        with a chord completion or cleanup on another worker.
+        """
+        self._governance_thread_lock.acquire()
+        try:
+            yield
+        finally:
+            self._governance_thread_lock.release()
+
+    # -- backend supplied storage primitives ---------------------------
+
+    def _iter_result_keys(self):
+        """Yield every task result key currently present in the store."""
+        raise NotImplementedError(
+            'Backend does not implement result key enumeration, required by '
+            'storage-side capacity governance.')
+
+    def _payload_size(self, raw):
+        if raw is None:
+            return 0
+        if isinstance(raw, (bytes, bytearray, memoryview)):
+            return len(raw)
+        return len(ensure_bytes(raw))
+
+    def _iter_result_payloads(self):
+        """Yield :class:`ScannedValue` for every stored task result.
+
+        The default implementation issues one GET per key; backends with
+        batching (Redis MGET) or stat() information (file system) override
+        this.
+        """
+        for key in self._iter_result_keys():
+            raw = self.get(key)
+            if raw is None:
+                # Expired between enumeration and read.
+                continue
+            yield ScannedValue(key, raw, self._payload_size(raw), None)
+
+    def _delete_result_keys(self, keys):
+        """Delete result keys, ignoring keys that vanished meanwhile.
+
+        This is what makes repeatedly triggered eviction idempotent: a key
+        that another run already removed is simply not there anymore.
+        """
+        for key in keys:
+            try:
+                self.delete(key)
+            except FileNotFoundError:
+                pass
+        return len(keys)
+
+    # -- scanning --------------------------------------------------------
+
+    def _snapshot_results(self):
+        records = []
+        for scanned in self._iter_result_payloads():
+            raw = scanned.raw
+            try:
+                meta = self.decode_result(raw)
+            except Exception:  # pylint: disable=broad-except
+                # Never let a foreign/corrupt value break a cleanup run;
+                # such keys are left strictly untouched.
+                logger.warning(
+                    'Skipping unreadable result key %r during governance '
+                    'scan', scanned.key, exc_info=True)
+                continue
+            date_done = parse_date_done(
+                meta.get('date_done'), self.app.timezone)
+            written_at = scanned.written_at
+            if written_at is None:
+                written_at = date_done.timestamp() if date_done else None
+            records.append(StoredResult(
+                key=scanned.key,
+                task_id=meta.get('task_id') or self._strip_prefix(scanned.key),
+                status=meta.get('status'),
+                date_done=date_done,
+                written_at=written_at,
+                size=(scanned.size if scanned.size is not None
+                      else self._payload_size(raw)),
+                group_id=meta.get('group_id'),
+                raw=raw,
+            ))
+        return records
+
+    def _group_alive(self, group_id, group_cache):
+        """Return True iff group metadata for ``group_id`` is in the store.
+
+        The only signal consulted is the group metadata key as it exists
+        in the store right now - never an in-memory marker and never a
+        caller supplied identifier.
+        """
+        if not group_id:
+            return False
+        if group_id not in group_cache:
+            group_cache[group_id] = bool(
+                self.get(self.get_key_for_group(group_id)))
+        return group_cache[group_id]
+
+    def _result_protection(self, record, group_cache):
+        if record.status not in states.READY_STATES:
+            # The task itself has not finished yet.
+            return True, 'unfinished'
+        if self._group_alive(record.group_id, group_cache):
+            # Group metadata still present -> group/chord in flight.
+            return True, 'group'
+        return False, None
+
+    # -- filtering and planning -----------------------------------------
+
+    def _make_filters(self, states_filter, task_ids, since, until):
+        since_dt = coerce_time_window(since, 'since', self.app.timezone)
+        until_dt = coerce_time_window(until, 'until', self.app.timezone)
+        if since_dt is not None and until_dt is not None \
+                and since_dt > until_dt:
+            raise ValueError('`since` is later than `until`')
+        return CleanupFilters(
+            states=normalize_value_set(states_filter, 'states'),
+            task_ids=normalize_value_set(task_ids, 'task_ids'),
+            since=since_dt,
+            until=until_dt,
+        )
+
+    def _record_matches_filters(self, record, filters):
+        if filters is None:
+            return True
+        if filters.states is not None and record.status not in filters.states:
+            return False
+        if filters.task_ids is not None \
+                and record.task_id not in filters.task_ids:
+            return False
+        if filters.since is not None and (
+                record.written_at is None
+                or record.written_at < filters.since.timestamp()):
+            return False
+        if filters.until is not None and (
+                record.written_at is None
+                or record.written_at > filters.until.timestamp()):
+            return False
+        return True
+
+    def _plan_cleanup(self, records, now, enforce_retention,
+                      enforce_capacity, filters):
+        """Decide which records retention/capacity eviction would remove."""
+        group_cache = {}
+        retention_picks = {}
+        capacity_pool = []
+        protected_count = 0
+        total_count = len(records)
+        total_bytes = 0
+        for record in records:
+            total_bytes += record.size
+            protected, _reason = self._result_protection(
+                record, group_cache)
+            if protected:
+                protected_count += 1
+                continue
+            if not self._record_matches_filters(record, filters):
+                continue
+            if (enforce_retention
+                    and record.status in self.governance_retention
+                    and record.written_at is not None
+                    and now - record.written_at
+                    >= self.governance_retention[record.status]):
+                retention_picks[record.key] = record
+            if (enforce_capacity
+                    and record.status in states.READY_STATES
+                    and record.written_at is not None):
+                capacity_pool.append(record)
+
+        to_delete = dict(retention_picks)
+        projected_count = total_count - len(to_delete)
+        projected_bytes = (
+            total_bytes - sum(r.size for r in to_delete.values()))
+        capacity_picks = {}
+        if enforce_capacity and (self.governance_max_results is not None
+                                 or self.governance_max_bytes is not None):
+            # Oldest write time first; the key is a deterministic tie
+            # breaker so repeated runs make identical choices.
+            ordered = sorted(
+                capacity_pool,
+                key=lambda r: (r.written_at, bytes_to_str(r.key)))
+            for record in ordered:
+                count_over = (
+                    self.governance_max_results is not None
+                    and projected_count > self.governance_max_results)
+                bytes_over = (
+                    self.governance_max_bytes is not None
+                    and projected_bytes > self.governance_max_bytes)
+                if not count_over and not bytes_over:
+                    break
+                if record.key not in to_delete:
+                    # Dedup against a key the retention tier already
+                    # selected - one key is deleted at most once.
+                    capacity_picks[record.key] = record
+                    to_delete[record.key] = record
+                    projected_count -= 1
+                    projected_bytes -= record.size
+        return {
+            'retention': retention_picks,
+            'capacity': capacity_picks,
+            'delete': to_delete,
+            'protected_count': protected_count,
+            'total_count': total_count,
+            'total_bytes': total_bytes,
+        }
+
+    def _execute_cleanup_plan(self, plan):
+        """Delete planned keys after re-verifying them under the lock.
+
+        Re-verification compares the value against what the scan saw and
+        re-checks group liveness, so a concurrent store_result or chord
+        completion cannot have its fresh value removed by a stale plan.
+        Returns ``(deleted_keys, freed_bytes)``.
+        """
+        group_cache = {}
+        keys = []
+        freed_bytes = 0
+        for record in plan['delete'].values():
+            raw = self.get(record.key)
+            if raw is None or raw != record.raw:
+                continue
+            try:
+                meta = self.decode_result(raw)
+            except Exception:  # pylint: disable=broad-except
+                continue
+            if meta.get('status') != record.status:
+                continue
+            group_id = meta.get('group_id')
+            if self._group_alive(group_id, group_cache):
+                continue
+            keys.append(record.key)
+            freed_bytes += record.size
+        self._delete_result_keys(keys)
+        for record in plan['delete'].values():
+            if record.key in keys:
+                # Drop stale values from the local read cache; otherwise a
+                # later get_task_meta() could observe an evicted SUCCESS.
+                self._cache.pop(record.task_id, None)
+        return keys, freed_bytes
+
+    @staticmethod
+    def _pagination_window(limit, offset):
+        offset = int(offset or 0)
+        if offset < 0:
+            raise ValueError('`offset` must be >= 0')
+        if limit is None:
+            return offset, None
+        limit = int(limit)
+        if limit < 0:
+            raise ValueError('`limit` must be >= 0')
+        return offset, offset + limit
+
+    # -- public API ------------------------------------------------------
+
+    def inspect_results(self, states=None, task_ids=None, since=None,
+                        until=None, tier=None, protected=None,
+                        limit=None, offset=0):
+        """List stored results without modifying the store.
+
+        Filters by final-state retention tier, state, write-time window and
+        task id.  Returns a :class:`ResultInventory` with per-state counts
+        and byte usage in addition to the (optionally paginated) items.
+        Only read operations are issued - no SET/DELETE/EXPIRE, no lock
+        keys, and the local result cache is neither read nor written.
+        """
+        if not self.governance_enabled:
+            raise ImproperlyConfigured(E_GOVERNANCE_DISABLED.strip())
+        filters = self._make_filters(states, task_ids, since, until)
+        tier_states = normalize_value_set(tier, 'tier')
+        if tier_states:
+            unknown = tier_states - set(self.governance_retention)
+            if unknown:
+                raise ValueError(
+                    'No retention tier configured for states: '
+                    + ', '.join(sorted(unknown)))
+            states_filter = tier_states if filters.states is None \
+                else filters.states & tier_states
+            filters = filters._replace(states=states_filter)
+
+        # Deliberately no storage lock here: this is a read-only inventory,
+        # and taking the storage lock would itself write a lock key. Keys
+        # that vanish mid-scan are skipped by the enumerator.
+        records = self._snapshot_results()
+        group_cache = {}
+        matching = []
+        for record in records:
+            if not self._record_matches_filters(record, filters):
+                continue
+            is_protected, reason = self._result_protection(
+                record, group_cache)
+            if protected is not None \
+                    and bool(is_protected) != bool(protected):
+                continue
+            matching.append((record, is_protected, reason))
+
+        by_state = {}
+        total_bytes = 0
+        for record, _is_protected, _reason in matching:
+            usage = by_state.get(record.status)
+            if usage is None:
+                by_state[record.status] = StateUsage(1, record.size)
+            else:
+                by_state[record.status] = StateUsage(
+                    usage.count + 1, usage.bytes + record.size)
+            total_bytes += record.size
+
+        # Oldest first; records without a known write time sort last.
+        matching.sort(key=lambda entry: (
+            entry[0].written_at is None,
+            entry[0].written_at if entry[0].written_at is not None else 0.0,
+            bytes_to_str(entry[0].key)))
+        window_start, window_end = self._pagination_window(limit, offset)
+        items = []
+        for record, is_protected, reason in matching[window_start:window_end]:
+            retention = self.governance_retention.get(record.status)
+            expires_at = None
+            if retention is not None and record.written_at is not None:
+                expires_at = datetime.fromtimestamp(
+                    record.written_at + retention, tz=self.app.timezone)
+            items.append(ResultInventoryItem(
+                task_id=record.task_id,
+                status=record.status,
+                date_done=record.date_done,
+                size_bytes=record.size,
+                group_id=record.group_id,
+                retention_seconds=retention,
+                expires_at=expires_at,
+                protected=is_protected,
+                protection_reason=reason,
+            ))
+        return ResultInventory(
+            items=items,
+            total_count=len(matching),
+            total_bytes=total_bytes,
+            by_state=by_state,
+        )
+
+    def cleanup_results(self, enforce_retention=True,
+                        enforce_capacity=True, states=None, task_ids=None,
+                        since=None, until=None, dry_run=False):
+        """Manually remove expired/over-capacity results.
+
+        Applies the per-state retention tiers and/or the count/byte
+        ceilings, optionally restricted by the same filters as
+        :meth:`inspect_results`.  With ``dry_run`` nothing is deleted;
+        the returned :class:`CleanupReport` describes what would happen.
+        """
+        if not self.governance_enabled:
+            raise ImproperlyConfigured(E_GOVERNANCE_DISABLED.strip())
+        filters = self._make_filters(states, task_ids, since, until)
+        now = self.app.now().timestamp()
+        with self._governance_storage_lock():
+            records = self._snapshot_results()
+            plan = self._plan_cleanup(
+                records, now,
+                enforce_retention=enforce_retention,
+                enforce_capacity=enforce_capacity,
+                filters=filters)
+            if dry_run:
+                deleted_keys = []
+                freed_bytes = 0
+            else:
+                deleted_keys, freed_bytes = self._execute_cleanup_plan(plan)
+            # Refresh the write-path estimate from actual occupancy.
+            self._governance_observed = (
+                plan['total_count'] - len(deleted_keys),
+                plan['total_bytes'] - freed_bytes)
+            self._governance_pending = 0
+            self._governance_pending_bytes = 0
+
+            retention_deleted = sum(
+                1 for key in deleted_keys if key in plan['retention'])
+            capacity_deleted = sum(
+                1 for key in deleted_keys if key in plan['capacity'])
+            if dry_run:
+                report_keys = [
+                    record.task_id
+                    for record in plan['delete'].values()]
+            else:
+                report_keys = [
+                    plan['delete'][key].task_id for key in deleted_keys]
+            return CleanupReport(
+                deleted_count=len(deleted_keys),
+                freed_bytes=freed_bytes,
+                keys=report_keys,
+                retention_deleted=retention_deleted,
+                capacity_deleted=capacity_deleted,
+                protected_count=plan['protected_count'],
+                inspected_count=plan['total_count'],
+                inspected_bytes=plan['total_bytes'],
+            )
+
+    def enforce_result_capacity(self):
+        """Run only the count/byte ceiling enforcement."""
+        return self.cleanup_results(
+            enforce_retention=False, enforce_capacity=True)
+
+    def enforce_result_retention(self):
+        """Run only the per-state retention tier cleanup."""
+        return self.cleanup_results(
+            enforce_retention=True, enforce_capacity=False)
+
+    def cleanup(self):
+        """Periodic backend cleanup hook (``celery.backend_cleanup``)."""
+        if self.governance_enabled:
+            return self.cleanup_results()
 
     def _apply_chord_incr(self, header_result_args, body, **kwargs):
         self.ensure_chords_allowed()

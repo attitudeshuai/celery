@@ -1,15 +1,21 @@
 """File-system result store backend."""
 import locale
 import os
+import time
+from contextlib import contextmanager
 from datetime import datetime
 
 from kombu.utils.encoding import ensure_bytes
 
 from celery import uuid
 from celery.backends.base import KeyValueStoreBackend
+from celery.backends.governance import ScannedValue
 from celery.exceptions import ImproperlyConfigured
+from celery.utils.log import get_logger
 
 default_encoding = locale.getpreferredencoding(False)
+
+logger = get_logger(__name__)
 
 E_NO_PATH_SET = 'You need to configure a path for the file-system backend'
 E_PATH_NON_CONFORMING_SCHEME = (
@@ -35,6 +41,10 @@ class FilesystemBackend(KeyValueStoreBackend):
 
     # Result files are opened in binary mode in both directions.
     supports_result_compression = True
+    # Results are files in one directory, so enumeration is a listdir().
+    supports_capacity_governance = True
+
+    governance_lock_name = b'.celery-governance.lock'
 
     def __init__(self, url=None, open=open, unlink=os.unlink, sep=os.sep,
                  encoding=default_encoding, *args, **kwargs):
@@ -98,8 +108,78 @@ class FilesystemBackend(KeyValueStoreBackend):
     def delete(self, key):
         self.unlink(self._filename(key))
 
+    # -- capacity governance storage primitives -------------------------
+
+    def _iter_result_payloads(self):
+        for name in os.listdir(self.path):
+            if not name.startswith(self.task_keyprefix):
+                # Group metadata, chord counters and the governance lock
+                # live in the same directory but are never task results.
+                continue
+            path = self._filename(name)
+            try:
+                stat = os.stat(path)
+                with self.open(path, 'rb') as infile:
+                    raw = infile.read()
+            except FileNotFoundError:
+                # Vanished between listdir() and open()/stat().
+                continue
+            yield ScannedValue(name, raw, stat.st_size, stat.st_mtime)
+
+    @contextmanager
+    def _governance_storage_lock(self):
+        lock_path = self._filename(self.governance_lock_name)
+        timeout = float(
+            self._governance_option('governance_lock_timeout', 10.0))
+        ttl = float(self._governance_option('governance_lock_ttl', 30.0))
+        token = uuid().encode()
+        acquired = False
+        with self._governance_thread_lock:
+            try:
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        fd = os.open(
+                            lock_path,
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                        with os.fdopen(fd, 'wb') as lockfile:
+                            lockfile.write(token)
+                        acquired = True
+                        break
+                    except FileExistsError:
+                        # Steal locks whose owner clearly died (stale mtime).
+                        try:
+                            if time.time() - os.stat(lock_path).st_mtime > ttl:
+                                self.unlink(lock_path)
+                                continue
+                        except FileNotFoundError:
+                            continue
+                        if time.monotonic() >= deadline:
+                            logger.warning(
+                                'Timed out after %ss waiting for the result '
+                                'governance lock; proceeding without it.',
+                                timeout)
+                            break
+                        time.sleep(0.05)
+                yield
+            finally:
+                if acquired:
+                    try:
+                        with self.open(lock_path, 'rb') as lockfile:
+                            owner = lockfile.read(len(token))
+                        if owner == token:
+                            self.unlink(lock_path)
+                    except FileNotFoundError:
+                        pass
+
     def cleanup(self):
-        """Delete expired meta-data."""
+        """Delete expired/over-capacity meta-data."""
+        if self.governance_enabled:
+            return super().cleanup()
+        self._cleanup_expired_results()
+
+    def _cleanup_expired_results(self):
+        """The legacy, expiry-only, scan of the result directory."""
         if not self.expires:
             return
         epoch = datetime(1970, 1, 1, tzinfo=self.app.timezone)

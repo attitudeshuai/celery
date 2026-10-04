@@ -1,6 +1,7 @@
 """Redis result store backend."""
 import time
 import warnings
+from contextlib import contextmanager
 from functools import partial
 from ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED
 from urllib.parse import unquote
@@ -9,11 +10,13 @@ from kombu.utils import symbol_by_name
 from kombu.utils.functional import retry_over_time
 from kombu.utils.objects import cached_property
 from kombu.utils.url import _parse_url, maybe_sanitize_url
+from kombu.utils.uuid import uuid
 from redis import CredentialProvider
 
 from celery import states
 from celery._state import task_join_will_block
 from celery.backends.base import _create_chord_error_with_cause
+from celery.backends.governance import ScannedValue
 from celery.canvas import maybe_signature
 from celery.exceptions import BackendStoreError, ChordError, ImproperlyConfigured
 from celery.result import GroupResult, allow_join_result
@@ -228,6 +231,8 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
     supports_native_join = True
     # Redis preserves binary payloads; response decoding disables compression.
     supports_result_compression = True
+    # SCAN/MGET/DEL allow storage-side capacity governance.
+    supports_capacity_governance = True
 
     #: Maximal length of string value in Redis.
     #: 512 MB - https://redis.io/topics/data-types
@@ -563,6 +568,120 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
 
     def expire(self, key, value):
         return self.client.expire(key, value)
+
+    # -- capacity governance storage primitives -------------------------
+
+    def _iter_result_keys(self):
+        match = self.task_keyprefix + self.key_t('*')
+        count = int(self._governance_option('governance_scan_count', 500))
+        client = self.client
+        scan_iter = getattr(client, 'scan_iter', None)
+        if scan_iter is not None:
+            try:
+                for key in scan_iter(match=match, count=count):
+                    yield key
+                return
+            except TypeError:
+                # Client exposes something called scan_iter that does not
+                # behave like redis-py's; fall back to KEYS below.
+                pass
+        # Fallback for clients without SCAN support.
+        keys = client.keys(match)
+        for key in keys:
+            yield key
+
+    def _iter_result_payloads(self):
+        batch = max(1, int(
+            self._governance_option('governance_mget_batch', 500)))
+        keys = list(self._iter_result_keys())
+        for start in range(0, len(keys), batch):
+            chunk = keys[start:start + batch]
+            values = self.mget(chunk)
+            for key, raw in zip(chunk, values):
+                if raw is None:
+                    continue
+                yield ScannedValue(key, raw, self._payload_size(raw), None)
+
+    def _delete_result_keys(self, keys):
+        keys = list(keys)
+        if not keys:
+            return 0
+        batch = max(1, int(
+            self._governance_option('governance_delete_batch', 256)))
+        deleted = 0
+        for start in range(0, len(keys), batch):
+            chunk = keys[start:start + batch]
+            with self.client.pipeline() as pipe:
+                pipe.delete(*chunk)
+                result, = pipe.execute()
+            # redis-py returns the number of removed keys; tolerant clients
+            # (and test doubles) may return a bool or per-key values.
+            if isinstance(result, (list, tuple)):
+                deleted += sum(1 for value in result if value)
+            else:
+                deleted += int(result or 0)
+        return deleted
+
+    _GOVERNANCE_RELEASE_LOCK = """
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+else
+    return 0
+end
+"""
+
+    @contextmanager
+    def _governance_storage_lock(self):
+        timeout = float(
+            self._governance_option('governance_lock_timeout', 10.0))
+        ttl = float(self._governance_option('governance_lock_ttl', 30.0))
+        # Keep the lock key away from the task key pattern so scans never
+        # see it; the global keyprefix is already part of group_keyprefix.
+        lock_key = self._get_key_for(
+            self.group_keyprefix, self.governance_lock_suffix)
+        token = self.key_t(uuid())
+        acquired = False
+        with self._governance_thread_lock:
+            try:
+                deadline = time.monotonic() + timeout
+                while True:
+                    try:
+                        acquired = bool(self.client.set(
+                            lock_key, token, nx=True,
+                            px=int(ttl * 1000)))
+                    except Exception:  # pylint: disable=broad-except
+                        # A client without SET NX PX support cannot give us
+                        # a cross-process lock; the in-process lock still
+                        # applies, so degrade rather than fail result writes.
+                        logger.warning(
+                            'Redis client does not support SET NX PX; '
+                            'governance lock is only effective in-process.',
+                            exc_info=True)
+                        acquired = False
+                        break
+                    if acquired:
+                        break
+                    if time.monotonic() >= deadline:
+                        logger.warning(
+                            'Timed out after %ss waiting for the result '
+                            'governance lock; proceeding without it.', timeout)
+                        break
+                    time.sleep(0.05)
+                yield
+            finally:
+                if acquired:
+                    try:
+                        self.client.eval(
+                            self._GOVERNANCE_RELEASE_LOCK, 1,
+                            lock_key, token)
+                    except Exception:  # pylint: disable=broad-except
+                        try:
+                            if self.client.get(lock_key) == token:
+                                self.client.delete(lock_key)
+                        except Exception:  # pylint: disable=broad-except
+                            logger.debug(
+                                'Failed to release governance lock %r',
+                                lock_key, exc_info=True)
 
     def add_to_chord(self, group_id, result):
         self.client.incr(self.get_key_for_group(group_id, '.t'), 1)

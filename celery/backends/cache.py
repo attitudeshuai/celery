@@ -1,4 +1,7 @@
 """Memcached and in-memory cache result backend."""
+import threading
+from contextlib import contextmanager
+
 from kombu.utils.encoding import bytes_to_str, ensure_bytes
 from kombu.utils.objects import cached_property
 
@@ -6,6 +9,7 @@ from celery.exceptions import ImproperlyConfigured
 from celery.utils.functional import LRUCache
 
 from .base import KeyValueStoreBackend
+from .governance import ScannedValue
 
 __all__ = ('CacheBackend',)
 
@@ -20,9 +24,21 @@ The cache backend {0!r} is unknown,
 Please use one of the following backends instead: {1}\
 """
 
+E_GOVERNANCE_MEMCACHED_UNSUPPORTED = """\
+Storage-side capacity governance cannot be enabled for the memcached cache
+backend: memcached does not allow enumerating stored result keys, so
+retention tiers, capacity ceilings and the result inventory are unavailable.
+Use the in-memory ('memory://') backend or another governance capable
+backend instead.\
+"""
+
 # Global shared in-memory cache for in-memory cache client
 # This is to share cache between threads
 _DUMMY_CLIENT_CACHE = LRUCache(limit=5000)
+
+# The in-memory store is shared between backend instances (and threads), so
+# governance runs on it share one process-wide lock.
+_MEMORY_GOVERNANCE_LOCK = threading.RLock()
 
 
 def import_best_memcache():
@@ -94,6 +110,9 @@ class CacheBackend(KeyValueStoreBackend):
     supports_autoexpire = True
     supports_native_join = True
     implements_incr = True
+    # The in-memory client can be enumerated; memcached cannot (the
+    # combination is rejected in _validate_governance_backend()).
+    supports_capacity_governance = True
 
     def __init__(self, app, expires=None, backend=None,
                  options=None, url=None, **kwargs):
@@ -115,6 +134,16 @@ class CacheBackend(KeyValueStoreBackend):
             raise ImproperlyConfigured(UNKNOWN_BACKEND.format(
                 self.backend, ', '.join(backends)))
         self._encode_prefixes()  # rencode the keyprefixes
+        # Now that the transport is known, reject governance on a transport
+        # that cannot enumerate its keys (memcached).
+        self._validate_governance_backend()
+
+    def _validate_governance_backend(self):
+        if not self.governance_enabled:
+            return
+        if getattr(self, 'backend', None) not in (None, 'memory'):
+            raise ImproperlyConfigured(
+                E_GOVERNANCE_MEMCACHED_UNSUPPORTED)
 
     def get(self, key):
         return self.client.get(key)
@@ -127,6 +156,31 @@ class CacheBackend(KeyValueStoreBackend):
 
     def delete(self, key):
         return self.client.delete(key)
+
+    # -- capacity governance storage primitives -------------------------
+
+    def _iter_result_payloads(self):
+        client = self.client
+        if not isinstance(client, DummyClient):
+            raise ImproperlyConfigured(
+                E_GOVERNANCE_MEMCACHED_UNSUPPORTED)
+        cache = client.cache
+        for key in list(cache.keys()):
+            if not key.startswith(self.task_keyprefix):
+                continue
+            raw = cache.get(key)
+            if raw is None:
+                continue
+            yield ScannedValue(key, raw, self._payload_size(raw), None)
+
+    @contextmanager
+    def _governance_storage_lock(self):
+        if isinstance(self.client, DummyClient):
+            with _MEMORY_GOVERNANCE_LOCK, self._governance_thread_lock:
+                yield
+        else:
+            with self._governance_thread_lock:
+                yield
 
     def _apply_chord_incr(self, header_result_args, body, **kwargs):
         chord_key = self.get_key_for_chord(header_result_args[0])

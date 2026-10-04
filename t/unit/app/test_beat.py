@@ -368,6 +368,24 @@ class test_Scheduler:
         s.install_default_entries({})
         assert 'celery.backend_cleanup' not in s.data
 
+    def test_install_default_entries_with_governance_enabled(self):
+        # Autoexpire backends (e.g. Redis) normally skip the periodic
+        # cleanup, but storage-side capacity governance needs it.
+        self.app.conf.result_expires = None
+        self.app.backend.supports_autoexpire = True
+        self.app.backend.governance_enabled = False
+        try:
+            s = mScheduler(app=self.app)
+            s.install_default_entries({})
+            assert 'celery.backend_cleanup' not in s.data
+
+            self.app.backend.governance_enabled = True
+            s = mScheduler(app=self.app)
+            s.install_default_entries({})
+            assert 'celery.backend_cleanup' in s.data
+        finally:
+            self.app.backend.governance_enabled = False
+
     def test_due_tick(self):
         scheduler = mScheduler(app=self.app)
         scheduler.add(name='test_due_tick',

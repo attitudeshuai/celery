@@ -267,8 +267,15 @@ class Scheduler:
 
     def install_default_entries(self, data):
         entries = {}
-        if self.app.conf.result_expires and \
-                not self.app.backend.supports_autoexpire:
+        backend = self.app.backend
+        # The periodic cleanup is needed both for backends without native
+        # expiry and whenever storage-side capacity governance is enabled
+        # (retention tiers / capacity ceilings are enforced there).
+        needs_cleanup = (
+            self.app.conf.result_expires
+            and not backend.supports_autoexpire
+        ) or getattr(backend, 'governance_enabled', False)
+        if needs_cleanup:
             if 'celery.backend_cleanup' not in data:
                 entries['celery.backend_cleanup'] = {
                     'task': 'celery.backend_cleanup',
