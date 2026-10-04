@@ -3,8 +3,9 @@
 import datetime
 import time
 import types
-from collections import deque
+from collections import deque, namedtuple
 from contextlib import contextmanager
+from functools import partial
 from weakref import proxy
 
 from dateutil.parser import isoparse
@@ -14,8 +15,12 @@ from vine import Thenable, barrier, promise
 from . import current_app, states
 from ._state import _set_task_join_will_block, task_join_will_block
 from .app import app_or_default
-from .exceptions import ImproperlyConfigured, IncompleteStream, TimeoutError
+from .exceptions import (ChordCallbackStarted, GroupRosterMissing, ImproperlyConfigured, IncompleteStream,
+                         TimeoutError)
 from .utils.graph import DependencyGraph, GraphFormatter
+from .utils.log import get_logger
+
+logger = get_logger(__name__)
 
 try:
     import tblib
@@ -25,6 +30,8 @@ except ImportError:
 __all__ = (
     'ResultBase', 'AsyncResult', 'ResultSet',
     'GroupResult', 'EagerResult', 'result_from_tuple',
+    'GroupRosterMember', 'GroupMemberRecovery', 'GroupRecoveryReport',
+    'ROSTER_PENDING', 'ROSTER_SENT', 'ROSTER_RECOVERING',
 )
 
 E_WOULDBLOCK = """\
@@ -57,6 +64,80 @@ def denied_join_result():
         yield
     finally:
         _set_task_join_will_block(reset_value)
+
+
+#: Group member roster lifecycle statuses.  These describe what the group
+#: itself knows about a member independently of the member's task state in
+#: the result backend (a result may be PENDING because it never ran, because
+#: it is running right now or because its stored result expired; the roster
+#: keeps these cases apart).
+#:
+#: frozen at group freeze time, delivery not confirmed yet
+ROSTER_PENDING = 'PENDING'
+#: task message confirmed delivered to the broker
+ROSTER_SENT = 'SENT'
+#: member claimed by a selective recovery run, redelivery in flight
+ROSTER_RECOVERING = 'RECOVERING'
+
+#: Reason codes used by :class:`GroupMemberRecovery` reports.
+MEMBER_REDELIVERED = 'redelivered'
+MEMBER_COMPLETED = 'completed'
+MEMBER_FAILED = 'failed'
+MEMBER_REVOKED = 'revoked'
+MEMBER_RUNNING = 'running'
+MEMBER_RETRYING = 'retrying'
+MEMBER_NEVER_DELIVERED = 'never_delivered'
+MEMBER_EXPIRED = 'expired'
+MEMBER_PENDING_GRACE = 'pending_grace'
+MEMBER_QUOTA_EXCEEDED = 'quota_exceeded'
+MEMBER_TASK_NOT_REGISTERED = 'task_not_registered'
+MEMBER_CLAIMED = 'claimed'
+MEMBER_PUBLISH_FAILED = 'publish_failed'
+
+#: Roster terminal statuses: a member in one of these is counted towards the
+#: group exactly once and can never be redelivered.
+ROSTER_TERMINAL_STATES = frozenset({
+    states.SUCCESS, states.FAILURE, states.REVOKED,
+})
+
+#: Roster view of a single member, in submission order.
+GroupRosterMember = namedtuple('GroupRosterMember', (
+    'id', 'index', 'task', 'status', 'attempts', 'sent_at',
+))
+
+#: Outcome of the recovery judgement for a single member.
+GroupMemberRecovery = namedtuple('GroupMemberRecovery', (
+    'id', 'index', 'task', 'status', 'reason', 'attempts',
+))
+
+
+class GroupRecoveryReport(namedtuple('GroupRecoveryReport', (
+        'group_id', 'recovered', 'skipped'))):
+    """Result of a selective group member recovery run.
+
+    ``recovered`` lists the members that were judged lost and redelivered,
+    ``skipped`` lists every other member with the reason why it was left
+    alone (still running, retrying, already finished, inside the grace
+    window, over the redelivery quota, task no longer registered, ...).
+    """
+
+    def as_dict(self):
+        return {
+            'group_id': self.group_id,
+            'recovered': [m._asdict() for m in self.recovered],
+            'skipped': [m._asdict() for m in self.skipped],
+        }
+
+
+def _terminal_reason(state):
+    """Map a terminal task state to its recovery skip reason."""
+    if state == states.SUCCESS:
+        return MEMBER_COMPLETED
+    if state == states.FAILURE:
+        return MEMBER_FAILED
+    if state == states.REVOKED:
+        return MEMBER_REVOKED
+    return state
 
 
 class ResultBase:
@@ -1011,6 +1092,181 @@ class GroupResult(ResultSet):
     @property
     def children(self):
         return self.results
+
+    def roster(self):
+        """Report every member of this group from its roster.
+
+        The roster is written at freeze time in submission order and kept
+        up to date as members are delivered and finish; it is removed again
+        when the group ends.
+
+        Returns:
+            Tuple[GroupRosterMember]: members in submission order, each with
+            its task id, order index, task name, current roster status and
+            redelivery attempts.
+
+        Raises:
+            celery.exceptions.GroupRosterMissing: if the group ran without a
+                roster, already finished (roster cleaned up) or the roster
+                expired.
+        """
+        data = self.backend.restore_group_roster(self.id)
+        if not data:
+            raise GroupRosterMissing(
+                f'Group {self.id!r} has no member roster; it either ran '
+                f'without result_group_roster enabled, already finished or '
+                f'the roster expired')
+        return tuple(
+            GroupRosterMember(
+                id=member['id'],
+                index=member['index'],
+                task=member.get('task'),
+                status=member.get('status', ROSTER_PENDING),
+                attempts=member.get('attempts', 0),
+                sent_at=member.get('sent_at'),
+            )
+            for member in sorted(data['members'],
+                                 key=lambda member: member['index'])
+        )
+
+    def recover_lost(self, timeout=None, limit=None, producer=None):
+        """Redeliver only the members of this group that are lost.
+
+        Unlike rerunning the whole group, members that already completed
+        successfully (or failed, were revoked, are still running or
+        retrying) are left untouched. A member counts as lost in two, and
+        only two, situations:
+
+        - its message was never delivered (roster shows no delivery marker
+          and no task result exists), or
+        - it was delivered but its result disappeared before the member was
+          counted (result expired), so it can never report back.
+
+        Lost members are redelivered with their original task id, so a late
+            report from the original delivery is deduplicated by the backend
+            and the completion count stays exact.
+
+        Arguments:
+            timeout (float): Seconds to wait since the first (re)delivery
+                before judging a silent member lost. Defaults to
+                :setting:`result_group_member_recovery_timeout`.
+            limit (int): Maximum redelivery attempts per member; members at
+                the limit are reported with ``quota_exceeded``. Defaults to
+                :setting:`result_group_member_recovery_limit`.
+            producer (kombu.Producer): Optional producer to publish with.
+
+        Returns:
+            GroupRecoveryReport: redelivered and skipped members, each with
+            a reason.
+
+        Raises:
+            celery.exceptions.GroupRosterMissing: no roster stored.
+            celery.exceptions.ChordCallbackStarted: the chord callback has
+                already started, so recovery is refused.
+        """
+        from celery.canvas import maybe_signature
+
+        app = self.app
+        backend = self.backend
+        data = backend.restore_group_roster(self.id)
+        if not data:
+            raise GroupRosterMissing(
+                f'Group {self.id!r} has no member roster; it either ran '
+                f'without result_group_roster enabled, already finished or '
+                f'the roster expired')
+        if data.get('callback'):
+            raise ChordCallbackStarted(
+                f'Chord callback for group {self.id!r} has already started; '
+                f'recovering members now cannot affect it anymore')
+        if timeout is None:
+            timeout = app.conf.result_group_member_recovery_timeout
+        if limit is None:
+            limit = app.conf.result_group_member_recovery_limit
+        created_at = data.get('created_at') or 0.0
+        now = time.time()
+
+        recovered = []
+        skipped = []
+        for entry in sorted(data['members'],
+                            key=lambda member: member['index']):
+            tid, index = entry['id'], entry['index']
+            task_name = entry.get('task')
+            status = entry.get('status', ROSTER_PENDING)
+            attempts = entry.get('attempts', 0) or 0
+            item = partial(GroupMemberRecovery, tid, index, task_name)
+
+            if status in ROSTER_TERMINAL_STATES:
+                skipped.append(item(status, _terminal_reason(status), attempts))
+                continue
+
+            # The live task result is authoritative for states the roster
+            # update may have lost a race with.
+            meta = backend.get_task_meta(tid, cache=False)
+            state = meta.get('status', states.PENDING)
+            if state in ROSTER_TERMINAL_STATES:
+                # Bring the roster in line with the stored terminal state so
+                # the member is never judged lost on a later run.
+                backend.mark_group_member_done(self.id, tid, state)
+                skipped.append(item(state, _terminal_reason(state), attempts))
+                continue
+            if state == states.RETRY:
+                skipped.append(item(state, MEMBER_RETRYING, attempts))
+                continue
+            if state in (states.STARTED, states.RECEIVED):
+                skipped.append(item(state, MEMBER_RUNNING, attempts))
+                continue
+
+            # No live result: distinguish "never delivered" from "delivered
+            # but result expired", and never judge before the grace window.
+            sent_at = entry.get('sent_at')
+            observed_at = sent_at if sent_at else created_at
+            if observed_at and now - observed_at < timeout:
+                skipped.append(item(status, MEMBER_PENDING_GRACE, attempts))
+                continue
+
+            lost_reason = (MEMBER_EXPIRED if sent_at
+                           else MEMBER_NEVER_DELIVERED)
+            if attempts >= limit:
+                skipped.append(item(status, MEMBER_QUOTA_EXCEEDED, attempts))
+                continue
+
+            # Atomic claim: concurrent recovery runs (or a member finishing
+            # right now) cannot both redeliver.
+            if not backend.claim_group_member_recovery(
+                    self.id, tid, reclaim_after=timeout):
+                skipped.append(item(ROSTER_RECOVERING, MEMBER_CLAIMED,
+                                    attempts))
+                continue
+
+            try:
+                sig = maybe_signature(entry['signature'], app=app)
+                # Deterministic behaviour for a task whose name changed / is
+                # no longer registered: report it, never guess another task.
+                if sig is None or sig.task not in app.tasks:
+                    backend.release_group_member_recovery(self.id, tid)
+                    skipped.append(item(status,
+                                        MEMBER_TASK_NOT_REGISTERED, attempts))
+                    continue
+                try:
+                    # Same task id keeps result, group/chord headers and
+                    # completion count attached to the original member.
+                    sig.apply_async(producer=producer, add_to_parent=False)
+                except Exception:  # pylint: disable=broad-except
+                    backend.release_group_member_recovery(self.id, tid)
+                    logger.warning(
+                        'Failed to redeliver lost group member %r of '
+                        'group %r', tid, self.id, exc_info=True)
+                    skipped.append(item(status, MEMBER_PUBLISH_FAILED,
+                                        attempts))
+                    continue
+            except Exception:  # pylint: disable=broad-except
+                backend.release_group_member_recovery(self.id, tid)
+                raise
+
+            backend.mark_group_member_sent(self.id, tid, attempts=attempts + 1)
+            recovered.append(item(ROSTER_SENT, lost_reason, attempts + 1))
+
+        return GroupRecoveryReport(self.id, recovered, skipped)
 
     @classmethod
     def restore(cls, id, backend=None, app=None):

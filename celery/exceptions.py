@@ -21,6 +21,8 @@ Error Hierarchy
             - :exc:`~celery.exceptions.TaskRevokedError`
             - :exc:`~celery.exceptions.InvalidTaskError`
             - :exc:`~celery.exceptions.ChordError`
+            - :exc:`~celery.exceptions.GroupRosterMissing`
+            - :exc:`~celery.exceptions.ChordCallbackStarted`
         - :exc:`~celery.exceptions.BackendError`
             - :exc:`~celery.exceptions.BackendGetMetaError`
             - :exc:`~celery.exceptions.BackendStoreError`
@@ -81,6 +83,7 @@ __all__ = (
     'NotRegistered', 'AlreadyRegistered', 'TimeoutError',
     'MaxRetriesExceededError', 'TaskRevokedError',
     'InvalidTaskError', 'ChordError',
+    'GroupRosterMissing', 'ChordCallbackStarted',
 
     # Backend related errors.
     'BackendError', 'BackendGetMetaError', 'BackendStoreError',
@@ -264,6 +267,26 @@ class InvalidTaskError(TaskError):
 
 class ChordError(TaskError):
     """A task part of the chord raised an exception."""
+
+
+class GroupRosterMissing(TaskError):
+    """No group member roster is stored for the group.
+
+    Raised by roster based operations (status reporting and selective
+    member recovery) when the group either ran without a roster, already
+    finished (the roster is cleaned up when the group ends) or the roster
+    expired from the result backend.
+    """
+
+
+class ChordCallbackStarted(TaskError):
+    """The chord callback has already started.
+
+    Raised when a selective member recovery is requested after the group
+    reached its final count and the callback dispatch began. Recovering
+    members past that point can no longer influence the callback and would
+    only cause duplicate executions, so recovery is refused.
+    """
 
 
 class CPendingDeprecationWarning(PendingDeprecationWarning):

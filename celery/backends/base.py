@@ -6,6 +6,7 @@
     using K/V semantics like _get and _put.
 """
 import sys
+import threading
 import time
 import warnings
 from collections import deque, namedtuple
@@ -29,7 +30,8 @@ from celery._state import get_current_task
 from celery.app.task import Context
 from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
                                NotRegistered, SecurityError, TaskRevokedError, TimeoutError)
-from celery.result import GroupResult, ResultBase, ResultSet, allow_join_result, result_from_tuple
+from celery.result import (ROSTER_PENDING, ROSTER_RECOVERING, ROSTER_SENT, ROSTER_TERMINAL_STATES, GroupResult,
+                           ResultBase, ResultSet, allow_join_result, result_from_tuple)
 from celery.utils.collections import BufferMap
 from celery.utils.functional import LRUCache, arity_greater
 from celery.utils.log import get_logger
@@ -259,6 +261,8 @@ class Backend:
             self.store_result(task_id, result, state, request=request)
         if request and request.chord:
             self.on_chord_part_return(request, state, result)
+        else:
+            self._roster_track_plain_member(request, state)
 
     def mark_as_failure(self, task_id, exc,
                         traceback=None, request=None,
@@ -272,6 +276,8 @@ class Backend:
             # This task may be part of a chord
             if request.chord:
                 self.on_chord_part_return(request, state, exc)
+            else:
+                self._roster_track_plain_member(request, state)
             # It might also have chained tasks which need to be propagated to,
             # this is most likely to be exclusive with being a direct part of a
             # chord but we'll handle both cases separately.
@@ -386,6 +392,8 @@ class Backend:
                               traceback=None, request=request)
         if request and request.chord:
             self.on_chord_part_return(request, state, exc)
+        else:
+            self._roster_track_plain_member(request, state)
 
     def mark_as_retry(self, task_id, exc, traceback=None,
                       request=None, store_result=True, state=states.RETRY):
@@ -920,7 +928,10 @@ class Backend:
 
     def delete_group(self, group_id):
         self._cache.pop(group_id, None)
-        return self._ensure_retryable(self._delete_group, group_id=group_id)
+        self._ensure_retryable(self._delete_group, group_id=group_id)
+        if self.group_roster_enabled():
+            self._ensure_retryable(self.delete_group_roster,
+                                   group_id=group_id)
 
     def cleanup(self):
         """Backend cleanup."""
@@ -935,10 +946,89 @@ class Backend:
         raise NotImplementedError('Backend does not support add_to_chord')
 
     def on_chord_part_return(self, request, state, result, **kwargs):
-        pass
+        # Backends without native chords and without an incrementing counter
+        # complete groups through the polling ``celery.chord_unlock`` task;
+        # they still keep the roster (if enabled) up to date so reporting and
+        # selective member recovery work on those backends too.
+        if request is not None and request.group and self.group_roster_enabled():
+            self.mark_group_member_done(request.group, request.id, state)
 
     def set_chord_size(self, group_id, chord_size):
         pass
+
+    # -- Group member roster ------------------------------------------------
+    #
+    # The roster is an ordered, durable record of every member a group
+    # committed to at freeze time. It is only touched when the
+    # ``result_group_roster`` setting is enabled; the default no-op
+    # implementations below keep the freeze/deliver/count paths byte for byte
+    # identical (and free of extra backend round trips) when it is off.
+    def group_roster_enabled(self):
+        """Whether group member rosters are maintained for this backend."""
+        return bool(self.app.conf.get('result_group_roster', False))
+
+    def save_group_roster(self, group_id, members, created_at=None):
+        """Settle the roster at freeze time, in submission order.
+
+        Arguments:
+            group_id (str): The id of the group.
+            members (List[dict]): One entry per member. Each entry carries at
+                least ``id``, ``index`` (submission order), ``task`` (task
+                name) and ``signature`` (a serializable signature used to
+                redeliver the member with its original task id).
+        """
+
+    def restore_group_roster(self, group_id):
+        """Return the stored roster mapping, or :const:`None` if absent."""
+        return None
+
+    def mark_group_member_sent(self, group_id, task_id, attempts=None):
+        """Record that the member's task message was delivered."""
+
+    def mark_group_member_done(self, group_id, task_id, state):
+        """Record a member's terminal state.
+
+        Returns:
+            bool: :const:`True` if this is the first terminal report for the
+                member, :const:`False` if it already was terminal. The return
+                value gates chord counters so a duplicate report (e.g. after a
+                selective redelivery of a member whose original report comes
+                in late) never increments the completion count twice.
+        """
+        return True
+
+    def claim_group_member_recovery(self, group_id, task_id,
+                                    reclaim_after=None):
+        """Atomically claim a member for selective redelivery.
+
+        Fails when another recovery run already claimed it, the member is
+        terminal or the group callback started. A stale ``RECOVERING`` claim
+        older than ``reclaim_after`` seconds may be taken over.
+        """
+        return False
+
+    def release_group_member_recovery(self, group_id, task_id):
+        """Release a recovery claim after redelivery failed."""
+
+    def mark_group_callback_started(self, group_id):
+        """Fence: mark that the group callback dispatch has started.
+
+        Returns :const:`False` when the callback was already marked, which
+        tells competing completion paths (native aggregation and the polling
+        unlock task) not to dispatch it a second time.
+        """
+        return True
+
+    def delete_group_roster(self, group_id):
+        """Remove the roster; called when the group has ended."""
+
+    def _roster_track_plain_member(self, request, state):
+        """Track completion of a group member that is not part of a chord."""
+        if not self.group_roster_enabled() or request is None:
+            return
+        group_id = getattr(request, 'group', None)
+        if group_id:
+            self.mark_group_member_done(group_id, request.id, state)
 
     def fallback_chord_unlock(self, header_result, body, countdown=1,
                               **kwargs):
@@ -1106,6 +1196,11 @@ class BaseKeyValueStoreBackend(Backend):
         self._encode_prefixes()
         if self.implements_incr:
             self.apply_chord = self._apply_chord_incr
+        # Per-group locks serialising roster read-modify-write cycles within
+        # this worker process. Backends with native atomic primitives (Redis)
+        # override the roster methods and do not rely on these.
+        self._roster_lock_guard = threading.Lock()
+        self._roster_locks = {}
 
     def _add_global_keyprefix(self):
         """
@@ -1324,17 +1419,167 @@ class BaseKeyValueStoreBackend(Backend):
             meta['result'] = result_from_tuple(result, self.app)
             return meta
 
+    # -- Group member roster (generic key/value implementation) -------------
+    #: Storage suffix appended to the group key for the roster.
+    roster_suffix = '.r'
+
+    def get_key_for_group_roster(self, group_id):
+        """Get the storage key of the roster for a group by id."""
+        return self.get_key_for_group(group_id, self.roster_suffix)
+
+    def _roster_lock(self, group_id):
+        with self._roster_lock_guard:
+            try:
+                lock = self._roster_locks[group_id]
+            except KeyError:
+                lock = self._roster_locks[group_id] = threading.Lock()
+            return lock
+
+    @staticmethod
+    def _find_roster_member(data, task_id):
+        for member in data['members']:
+            if member['id'] == task_id:
+                return member
+
+    def _roster_load(self, group_id):
+        payload = self.get(self.get_key_for_group_roster(group_id))
+        if not payload:
+            return None
+        return self.decode(payload)
+
+    def _roster_dump(self, group_id, data):
+        self.set(self.get_key_for_group_roster(group_id), self.encode(data))
+
+    def _roster_modify(self, group_id, mutator):
+        """Load a roster, apply ``mutator(data) -> value``, store it.
+
+        The whole read-modify-write cycle holds the per-group lock so
+        concurrent part returns and recovery claims in this process are
+        serialised. Returns :const:`None` when the roster no longer exists
+        (the group already ended).
+        """
+        with self._roster_lock(group_id):
+            data = self._roster_load(group_id)
+            if data is None:
+                return None
+            value = mutator(data)
+            self._roster_dump(group_id, data)
+            return value
+
+    def save_group_roster(self, group_id, members, created_at=None):
+        members = [dict(member) for member in members]
+        for member in members:
+            member.setdefault('status', ROSTER_PENDING)
+            member.setdefault('attempts', 0)
+            member.setdefault('sent_at', None)
+            member.setdefault('recovering_at', None)
+        data = {
+            'created_at': created_at if created_at is not None else time.time(),
+            'callback': False,
+            'members': members,
+        }
+        with self._roster_lock(group_id):
+            self._roster_dump(group_id, data)
+        return data
+
+    def restore_group_roster(self, group_id):
+        return self._roster_load(group_id)
+
+    def mark_group_member_sent(self, group_id, task_id, attempts=None):
+        def _mark(data):
+            member = self._find_roster_member(data, task_id)
+            if member is None:
+                return None
+            member['status'] = ROSTER_SENT
+            member['sent_at'] = time.time()
+            if attempts is not None:
+                member['attempts'] = attempts
+            member.pop('recovering_at', None)
+            return member
+
+        return self._roster_modify(group_id, _mark)
+
+    def mark_group_member_done(self, group_id, task_id, state):
+        def _mark(data):
+            member = self._find_roster_member(data, task_id)
+            if member is None or member['status'] in ROSTER_TERMINAL_STATES:
+                return False
+            member['status'] = state
+            member.pop('recovering_at', None)
+            return True
+
+        return bool(self._roster_modify(group_id, _mark))
+
+    def claim_group_member_recovery(self, group_id, task_id,
+                                    reclaim_after=None):
+        def _claim(data):
+            if data.get('callback'):
+                return False
+            member = self._find_roster_member(data, task_id)
+            if member is None or member['status'] in ROSTER_TERMINAL_STATES:
+                return False
+            if member['status'] == ROSTER_RECOVERING:
+                claimed_at = member.get('recovering_at') or 0
+                if reclaim_after is None or \
+                        time.time() - claimed_at < reclaim_after:
+                    return False
+            member['status'] = ROSTER_RECOVERING
+            member['recovering_at'] = time.time()
+            return True
+
+        return bool(self._roster_modify(group_id, _claim))
+
+    def release_group_member_recovery(self, group_id, task_id):
+        def _release(data):
+            member = self._find_roster_member(data, task_id)
+            if member is None or member['status'] != ROSTER_RECOVERING:
+                return None
+            member['status'] = (ROSTER_SENT if member.get('sent_at')
+                                else ROSTER_PENDING)
+            member.pop('recovering_at', None)
+            return member
+
+        return self._roster_modify(group_id, _release)
+
+    def mark_group_callback_started(self, group_id):
+        def _mark(data):
+            if data.get('callback'):
+                return False
+            data['callback'] = True
+            return True
+
+        result = self._roster_modify(group_id, _mark)
+        # No roster (roster expired or plain group without one): nothing to
+        # fence against, let the normal completion proceed.
+        return True if result is None else bool(result)
+
+    def delete_group_roster(self, group_id):
+        self.delete(self.get_key_for_group_roster(group_id))
+        with self._roster_lock_guard:
+            self._roster_locks.pop(group_id, None)
+
     def _apply_chord_incr(self, header_result_args, body, **kwargs):
         self.ensure_chords_allowed()
         header_result = self.app.GroupResult(*header_result_args)
         header_result.save(backend=self)
 
     def on_chord_part_return(self, request, state, result, **kwargs):
-        if not self.implements_incr:
+        if request is None:
+            return
+        roster_on = self.group_roster_enabled()
+        if not self.implements_incr and not roster_on:
             return
         app = self.app
-        gid = request.group
+        gid = getattr(request, 'group', None)
         if not gid:
+            return
+        roster_first = True
+        if roster_on:
+            # First terminal report wins; a duplicate (the original delivery
+            # reporting after a selective redelivery, or two workers racing)
+            # must not move the completion counter.
+            roster_first = self.mark_group_member_done(gid, request.id, state)
+        if not self.implements_incr:
             return
         key = self.get_key_for_chord(gid)
         try:
@@ -1356,6 +1601,10 @@ class BaseKeyValueStoreBackend(Backend):
                     callback,
                     ChordError(f'GroupResult {gid} no longer exists'),
                 )
+        if roster_on and not roster_first:
+            # Already counted: leave the counter untouched. We still expire
+            # it below through the regular returns; do nothing here.
+            return
         val = self.incr(key)
         # Set the chord size to the value defined in the request, or fall back
         # to the number of dependencies we can see from the restored result
@@ -1366,6 +1615,11 @@ class BaseKeyValueStoreBackend(Backend):
             logger.warning('Chord counter incremented too many times for %r',
                            gid)
         elif val == size:
+            if roster_on:
+                # Fence before joining/dispatching: recovery past this point
+                # is refused, so no member can be redelivered while the
+                # callback is being sent.
+                self.mark_group_callback_started(gid)
             callback = maybe_signature(request.chord, app=app)
             j = deps.join_native if deps.supports_native_join else deps.join
             try:
@@ -1396,6 +1650,8 @@ class BaseKeyValueStoreBackend(Backend):
             finally:
                 deps.delete()
                 self.delete(key)
+                if roster_on:
+                    self.delete_group_roster(gid)
         else:
             self.expire(key, self.expires)
 

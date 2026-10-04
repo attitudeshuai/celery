@@ -223,6 +223,17 @@ NAMESPACES = Namespace(
         backend_transport_options=Option({}, type='dict'),
         chord_retry_interval=Option(1.0, type='float'),
         chord_join_timeout=Option(3.0, type='float'),
+        # Persist an ordered roster of group members at freeze time so that
+        # lost members can be detected and selectively redelivered. Disabled
+        # by default: when off, freezing, delivery and chord counting take no
+        # extra backend round trips.
+        group_roster=Option(False, type='bool'),
+        # Seconds a roster member may stay silent after its first delivery
+        # before selective recovery is allowed to judge it lost.
+        group_member_recovery_timeout=Option(3600.0, type='float'),
+        # Maximum number of selective redeliveries per roster member;
+        # members at the limit are reported instead of redelivered.
+        group_member_recovery_limit=Option(1, type='int'),
         backend_max_sleep_between_retries_ms=Option(10000, type='int'),
         backend_max_retries=Option(float("inf"), type='float'),
         backend_base_sleep_between_retries_ms=Option(10, type='int'),

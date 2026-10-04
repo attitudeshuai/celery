@@ -1554,6 +1554,22 @@ def _maybe_group(tasks, app):
     return tasks
 
 
+def _group_roster_entry(sig, result, index):
+    """Build one roster entry for a frozen, about-to-be-delivered member.
+
+    The entry captures the member identity (task id), its submission order
+    and the frozen signature (task name plus everything needed to redeliver
+    the member later with the very same task id, group/chord headers
+    included).
+    """
+    return {
+        'id': result.id,
+        'index': index,
+        'task': sig.task,
+        'signature': dict(sig),
+    }
+
+
 @Signature.register_type()
 class group(Signature):
     """Creates a group of tasks to be executed in parallel.
@@ -1695,6 +1711,16 @@ class group(Signature):
 
         options, group_id, root_id = self._freeze_gid(options)
         tasks = self._prepared(self.tasks, [], group_id, root_id, app)
+        if app.conf.result_group_roster:
+            # Settle the roster in submission order before any member
+            # message leaves the client. Materialising the prepared tasks
+            # (and therefore freezing every member) only happens when the
+            # roster is enabled, so the default path is unchanged.
+            tasks = list(tasks)
+            app.backend.save_group_roster(group_id, [
+                _group_roster_entry(sig, result, index)
+                for index, (sig, result, _member_group_id) in enumerate(tasks)
+            ])
         p = barrier()
         results = list(self._apply_tasks(tasks, producer, app, p,
                                          args=args, kwargs=kwargs, **options))
@@ -1883,6 +1909,12 @@ class group(Signature):
                 sig.apply_async(producer=producer, add_to_parent=False,
                                 chord=chord_obj, args=args, kwargs=kwargs,
                                 **options)
+                if app.conf.result_group_roster:
+                    # Delivery marker: together with the roster it lets
+                    # recovery tell "never delivered" apart from "delivered
+                    # but result expired". Only written when the roster is
+                    # enabled, so the default path takes no extra round trip.
+                    app.backend.mark_group_member_sent(group_id, res.id)
                 # adding callback to result, such that it will gradually
                 # fulfill the barrier.
                 #

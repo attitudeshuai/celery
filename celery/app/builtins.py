@@ -66,6 +66,7 @@ def add_unlock_chord_task(app):
         retry_options = {}
         if exchange_type is not None:
             retry_options['exchange_type'] = exchange_type
+        roster_on = app.backend.group_roster_enabled()
         try:
             ready = deps.ready()
         except Exception as exc:
@@ -79,6 +80,13 @@ def add_unlock_chord_task(app):
                     countdown=interval, max_retries=max_retries,
                     **retry_options,
                 )
+
+        if roster_on:
+            # Fence before joining/dispatching: if another completion path
+            # already started the callback, or a recovery run reached the end
+            # concurrently, do not dispatch it a second time.
+            if not app.backend.mark_group_callback_started(group_id):
+                return
 
         callback = maybe_signature(callback, app=app)
         try:
@@ -96,6 +104,9 @@ def add_unlock_chord_task(app):
             logger.exception('Chord %r raised: %r', group_id, exc)
             chord_error = _create_chord_error_with_cause(message=reason, original_exc=exc)
             app.backend.chord_error_from_stack(callback=callback, exc=chord_error)
+            if roster_on:
+                # The group reached a terminal (error) resolution.
+                app.backend.delete_group_roster(group_id)
         else:
             try:
                 callback.delay(ret)
@@ -103,7 +114,29 @@ def add_unlock_chord_task(app):
                 logger.exception('Chord %r raised: %r', group_id, exc)
                 chord_error = _create_chord_error_with_cause(message=f'Callback error: {exc!r}', original_exc=exc)
                 app.backend.chord_error_from_stack(callback=callback, exc=chord_error)
+            if roster_on:
+                app.backend.delete_group_roster(group_id)
     return unlock_chord
+
+
+@connect_on_app_finalize
+def add_group_recover_task(app):
+    """Task used to selectively redeliver lost members of a group.
+
+    Requires :setting:`result_group_roster` to have been enabled when the
+    group was frozen. Only members judged lost (never delivered or result
+    expired past the recovery timeout) are redelivered; members that already
+    completed are never executed again.
+    """
+    @app.task(name='celery.group_recover', bind=True, shared=False,
+              lazy=False)
+    def group_recover(self, group_id, timeout=None, limit=None):
+        # Build the GroupResult straight from the id: the roster, not a saved
+        # GroupResult, is the source of truth for the member list.
+        group_result = app.GroupResult(group_id, [], app=app)
+        report = group_result.recover_lost(timeout=timeout, limit=limit)
+        return report.as_dict()
+    return group_recover
 
 
 @connect_on_app_finalize

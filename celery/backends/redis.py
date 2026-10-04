@@ -1,11 +1,13 @@
 """Redis result store backend."""
 import time
+import uuid
 import warnings
 from functools import partial
 from ssl import CERT_NONE, CERT_OPTIONAL, CERT_REQUIRED
 from urllib.parse import unquote
 
 from kombu.utils import symbol_by_name
+from kombu.utils.encoding import bytes_to_str
 from kombu.utils.functional import retry_over_time
 from kombu.utils.objects import cached_property
 from kombu.utils.url import _parse_url, maybe_sanitize_url
@@ -16,7 +18,8 @@ from celery._state import task_join_will_block
 from celery.backends.base import _create_chord_error_with_cause
 from celery.canvas import maybe_signature
 from celery.exceptions import BackendStoreError, ChordError, ImproperlyConfigured
-from celery.result import GroupResult, allow_join_result
+from celery.result import (ROSTER_PENDING, ROSTER_RECOVERING, ROSTER_SENT, ROSTER_TERMINAL_STATES, GroupResult,
+                           allow_join_result)
 from celery.utils.functional import _regen, dictfilter
 from celery.utils.log import get_logger
 from celery.utils.time import humanize_seconds
@@ -603,8 +606,172 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
     def _transport_options(self):
         return self.app.conf.get('result_backend_transport_options', {})
 
+    # -- Group member roster (Redis native implementation) ------------------
+    #: Hash field holding roster level metadata inside the roster hash.
+    roster_meta_field = '__meta__'
+    #: Suffix of the hash mapping task id -> first terminal state.
+    roster_status_suffix = '.st'
+    #: Suffix of the hash mapping task id -> encoded chord result payload.
+    roster_done_suffix = '.d'
+    #: Suffix of the "callback started" fence marker.
+    roster_callback_suffix = '.c'
+
+    def get_key_for_group_roster(self, group_id):
+        """Get the storage key of the roster for a group by id."""
+        return self.get_key_for_group(group_id, '.r')
+
+    def _get_key_for_member_lock(self, group_id, task_id):
+        return self.get_key_for_group(group_id, f'.l:{task_id}')
+
+    def _roster_update_member(self, group_id, task_id, updater):
+        client = self.client
+        rkey = self.get_key_for_group_roster(group_id)
+        raw = client.hget(rkey, task_id)
+        if raw is None:
+            return None
+        member = updater(self.decode(raw))
+        if member is not None:
+            client.hset(rkey, task_id, self.encode(member))
+        return member
+
+    def save_group_roster(self, group_id, members, created_at=None):
+        created_at = created_at if created_at is not None else time.time()
+        mapping = {
+            self.roster_meta_field: self.encode({'created_at': created_at}),
+        }
+        for raw_member in members:
+            member = dict(raw_member)
+            member.setdefault('status', ROSTER_PENDING)
+            member.setdefault('attempts', 0)
+            member.setdefault('sent_at', None)
+            member.setdefault('recovering_at', None)
+            mapping[member['id']] = self.encode(member)
+        rkey = self.get_key_for_group_roster(group_id)
+        with self.client.pipeline() as pipe:
+            pipe.hset(rkey, mapping=mapping)
+            if self.expires:
+                pipe.expire(rkey, self.expires)
+            pipe.execute()
+
+    def restore_group_roster(self, group_id):
+        raw = self.client.hgetall(self.get_key_for_group_roster(group_id))
+        if not raw:
+            return None
+        members = []
+        created_at = None
+        for field, payload in raw.items():
+            field = bytes_to_str(field)
+            if field == self.roster_meta_field:
+                created_at = self.decode(payload).get('created_at')
+                continue
+            members.append(self.decode(payload))
+        members.sort(key=lambda member: member['index'])
+        callback = bool(self.client.exists(
+            self.get_key_for_group(group_id, self.roster_callback_suffix)))
+        return {'created_at': created_at, 'callback': callback,
+                'members': members}
+
+    def mark_group_member_sent(self, group_id, task_id, attempts=None):
+        def _update(member):
+            member['status'] = ROSTER_SENT
+            member['sent_at'] = time.time()
+            if attempts is not None:
+                member['attempts'] = attempts
+            member.pop('recovering_at', None)
+            return member
+
+        return self._roster_update_member(group_id, task_id, _update)
+
+    def mark_group_member_done(self, group_id, task_id, state):
+        client = self.client
+        stkey = self.get_key_for_group(group_id, self.roster_status_suffix)
+        # HSETNX is atomic: exactly one terminal report per member wins.
+        new = bool(client.hsetnx(stkey, task_id, state))
+        if new:
+            def _update(member):
+                member['status'] = state
+                member.pop('recovering_at', None)
+                return member
+
+            self._roster_update_member(group_id, task_id, _update)
+            if self.expires:
+                client.expire(stkey, self.expires)
+        return new
+
+    def claim_group_member_recovery(self, group_id, task_id,
+                                    reclaim_after=None):
+        if reclaim_after is None:
+            reclaim_after = self.app.conf.result_group_member_recovery_timeout
+        client = self.client
+        rkey = self.get_key_for_group_roster(group_id)
+        stkey = self.get_key_for_group(group_id, self.roster_status_suffix)
+        ckey = self.get_key_for_group(group_id, self.roster_callback_suffix)
+        lkey = self._get_key_for_member_lock(group_id, task_id)
+        token = uuid.uuid4().hex
+        if not client.set(lkey, token, nx=True, ex=max(1, int(reclaim_after))):
+            return False
+        if client.hexists(stkey, task_id) or client.exists(ckey):
+            client.delete(lkey)
+            return False
+        raw = client.hget(rkey, task_id)
+        if raw is None:
+            client.delete(lkey)
+            return False
+        member = self.decode(raw)
+        if member['status'] in ROSTER_TERMINAL_STATES:
+            client.delete(lkey)
+            return False
+        if member['status'] == ROSTER_RECOVERING:
+            claimed_at = member.get('recovering_at') or 0
+            if time.time() - claimed_at < reclaim_after:
+                client.delete(lkey)
+                return False
+        member['status'] = ROSTER_RECOVERING
+        member['recovering_at'] = time.time()
+        client.hset(rkey, task_id, self.encode(member))
+        if self.expires:
+            client.expire(rkey, self.expires)
+        return True
+
+    def release_group_member_recovery(self, group_id, task_id):
+        client = self.client
+        client.delete(self._get_key_for_member_lock(group_id, task_id))
+
+        def _update(member):
+            if member.get('status') != ROSTER_RECOVERING:
+                return None
+            member['status'] = (ROSTER_SENT if member.get('sent_at')
+                                else ROSTER_PENDING)
+            member.pop('recovering_at', None)
+            return member
+
+        return self._roster_update_member(group_id, task_id, _update)
+
+    def mark_group_callback_started(self, group_id):
+        ckey = self.get_key_for_group(group_id, self.roster_callback_suffix)
+        if self.expires:
+            return bool(self.client.set(
+                ckey, '1', nx=True, ex=self.expires))
+        return bool(self.client.set(ckey, '1', nx=True))
+
+    def delete_group_roster(self, group_id):
+        with self.client.pipeline() as pipe:
+            pipe.delete(self.get_key_for_group_roster(group_id))
+            pipe.delete(self.get_key_for_group(
+                group_id, self.roster_status_suffix))
+            pipe.delete(self.get_key_for_group(
+                group_id, self.roster_callback_suffix))
+            pipe.execute()
+
     def on_chord_part_return(self, request, state, result,
                              propagate=None, **kwargs):
+        if self.group_roster_enabled():
+            return self._on_chord_part_return_roster(request, state, result)
+        return self._on_chord_part_return_native(
+            request, state, result, propagate=propagate)
+
+    def _on_chord_part_return_native(self, request, state, result,
+                                     propagate=None, **kwargs):
         app = self.app
         tid, gid, group_index = request.id, request.group, request.group_index
         if not gid or not tid:
@@ -693,6 +860,140 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
                 return self.chord_error_from_stack(callback, exc)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception('Chord %r raised: %r', request.group, exc)
+                return self.chord_error_from_stack(
+                    callback,
+                    ChordError(f'Join error: {exc!r}'),
+                )
+
+    def _on_chord_part_return_roster(self, request, state, result):
+        """Chord completion with the member roster deduplicating reports.
+
+        Difference from the native aggregation: the roster hash records the
+        first terminal report per member (``HSETNX``), the ordered set only
+        admits each task id once (``ZADD ... NX``), and the callback is
+        dispatched only by the report whose add brings the distinct count to
+        the expected total. A late duplicate (e.g. an original delivery that
+        reports after a selective redelivery) therefore can neither fire the
+        callback twice nor inflate the count.
+        """
+        app = self.app
+        tid, gid, group_index = request.id, request.group, request.group_index
+        if not gid or not tid:
+            return
+        if group_index is None:
+            group_index = '+inf'
+
+        client = self.client
+        jkey = self.get_key_for_group(gid, '.j')
+        tkey = self.get_key_for_group(gid, '.t')
+        skey = self.get_key_for_group(gid, '.s')
+        rkey = self.get_key_for_group_roster(gid)
+        stkey = self.get_key_for_group(gid, self.roster_status_suffix)
+        dkey = self.get_key_for_group(gid, self.roster_done_suffix)
+        ckey = self.get_key_for_group(gid, self.roster_callback_suffix)
+        result = self.encode_result(result, state)
+        encoded = self.encode([1, tid, state, result])
+        # The pipeline is a MULTI/EXEC transaction, so the first-report gate
+        # (HSETNX), ordered membership (ZADD NX) and the distinct count are
+        # observed atomically by every worker reporting concurrently.
+        with client.pipeline() as pipe:
+            pipe.hsetnx(dkey, tid, encoded) \
+                .zadd(jkey, {tid: group_index}, nx=True) \
+                .zcount(jkey, "-inf", "+inf") \
+                .get(tkey).get(skey)
+            if self.expires:
+                pipe.expire(jkey, self.expires) \
+                    .expire(tkey, self.expires) \
+                    .expire(skey, self.expires) \
+                    .expire(rkey, self.expires) \
+                    .expire(stkey, self.expires) \
+                    .expire(dkey, self.expires)
+            new, _added, readycount, totaldiff, chord_size_bytes = \
+                pipe.execute()[:5]
+
+        new = bool(new)
+        if new:
+            def _update(member):
+                member['status'] = state
+                member.pop('recovering_at', None)
+                return member
+
+            self._roster_update_member(gid, tid, _update)
+
+        totaldiff = int(totaldiff or 0)
+
+        if chord_size_bytes:
+            try:
+                callback = maybe_signature(request.chord, app=app)
+                total = int(chord_size_bytes) + totaldiff
+                if readycount == total and new:
+                    # Exactly this report completed the set of distinct
+                    # members. Fence before joining/dispatching so a recovery
+                    # run racing us can no longer redeliver anyone.
+                    self.mark_group_callback_started(gid)
+                    header_result = GroupResult.restore(gid, app=app)
+                    if header_result is not None:
+                        # Complex header saved by ``apply_chord()``.
+                        header_result.on_ready()
+                        join_func = (
+                            header_result.join_native
+                            if header_result.supports_native_join
+                            else header_result.join
+                        )
+                        with allow_join_result():
+                            resl = join_func(
+                                timeout=app.conf.result_chord_join_timeout,
+                                propagate=True
+                            )
+                    else:
+                        # Results keyed by task id, taken back in submission
+                        # order so the callback receives the same ordering a
+                        # group without recovery would have produced.
+                        decode, unpack = self.decode, self._unpack_chord_result
+                        ordered_tids = client.zrange(jkey, 0, -1)
+                        payloads = client.hmget(dkey, ordered_tids)
+                        resl = [unpack(payload, decode)
+                                for payload in payloads]
+                    try:
+                        callback.delay(resl)
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.exception(
+                            'Chord callback for %r raised: %r',
+                            request.group, exc)
+                        return self.chord_error_from_stack(
+                            callback,
+                            ChordError(f'Callback error: {exc!r}'),
+                        )
+                    finally:
+                        with client.pipeline() as pipe:
+                            pipe.delete(jkey) \
+                                .delete(tkey) \
+                                .delete(skey) \
+                                .delete(rkey) \
+                                .delete(stkey) \
+                                .delete(dkey) \
+                                .delete(ckey) \
+                                .execute()
+            except ChordError as exc:
+                logger.exception('Chord %r raised: %r', request.group, exc)
+                # The group reached a terminal (error) resolution: release
+                # the roster, but leave the aggregation keys untouched to
+                # match the native path's late-return behaviour.
+                with client.pipeline() as pipe:
+                    pipe.delete(rkey) \
+                        .delete(stkey) \
+                        .delete(dkey) \
+                        .delete(ckey) \
+                        .execute()
+                return self.chord_error_from_stack(callback, exc)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception('Chord %r raised: %r', request.group, exc)
+                with client.pipeline() as pipe:
+                    pipe.delete(rkey) \
+                        .delete(stkey) \
+                        .delete(dkey) \
+                        .delete(ckey) \
+                        .execute()
                 return self.chord_error_from_stack(
                     callback,
                     ChordError(f'Join error: {exc!r}'),
