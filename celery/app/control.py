@@ -178,6 +178,24 @@ class Inspect:
         """
         return self._request('reserved')
 
+    def event_snapshot(self, since_seq=0, limit=1000):
+        """Return an event continuity state snapshot.
+
+        The snapshot contains the worker's current event session/sequence
+        bookkeeping plus its active, reserved and recently completed tasks.
+        Monitors use it to resynchronize after detecting a gap in the
+        event stream.
+
+        Arguments:
+            since_seq (int): Last sequence number observed contiguously.
+            limit (int): Maximum number of recently completed task ids.
+
+        Returns:
+            Dict: Dictionary ``{HOSTNAME: {'ok': SNAPSHOT}}``.
+        """
+        return self._request('event_snapshot',
+                             since_seq=since_seq, limit=limit)
+
     def stats(self):
         """Return statistics of worker.
 

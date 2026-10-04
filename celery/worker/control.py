@@ -1,6 +1,7 @@
 """Worker remote control command implementations."""
 import io
 import tempfile
+import time
 from collections import UserDict, defaultdict, namedtuple
 
 from billiard.common import TERM_SIGNAME
@@ -383,6 +384,58 @@ def heartbeat(state):
     dispatcher = state.consumer.event_dispatcher
     if dispatcher:
         dispatcher.send('worker-heartbeat', freq=5, **worker_state.SOFTWARE_INFO)
+
+
+@inspect_command(
+    args=[('since_seq', int), ('limit', int)],
+    signature='[since_seq=0] [limit=1000]',
+)
+def event_snapshot(state, since_seq=0, limit=1000, **kwargs):
+    """Snapshot used to resynchronize monitors after an event gap.
+
+    Returns the event dispatcher's continuity bookkeeping (current session
+    id, last sequence number and recorded drops) together with the tasks
+    currently active, reserved (excluding active) and the ids of recently
+    completed tasks, so a monitor can correct state that diverged due to
+    lost events.
+
+    Keyword Arguments:
+        since_seq (int): Sequence number the monitor has seen contiguously
+            (informational; the snapshot always reflects current state).
+        limit (int): Maximum number of recently completed task ids to
+            return.
+    """
+    # pidbox argument coercion may hand through unexpected types when the
+    # command is invoked manually.
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        limit = 1000
+    if not isinstance(since_seq, int) or isinstance(since_seq, bool) \
+            or since_seq < 0:
+        since_seq = 0
+
+    dispatcher = state.consumer.event_dispatcher
+    continuity = dispatcher.continuity_info() if dispatcher else None
+
+    active = [request.info() for request in worker_state.active_requests]
+    reserved = [
+        request.info()
+        for request in (
+            state.tset(worker_state.reserved_requests) -
+            state.tset(worker_state.active_requests))
+    ]
+    completed = list(worker_state.successful_requests)
+    if len(completed) > limit:
+        completed = completed[-limit:]
+
+    return ok({
+        'hostname': state.hostname,
+        'timestamp': time.time(),
+        'since_seq': since_seq,
+        'continuity': continuity,
+        'active': active,
+        'reserved': reserved,
+        'completed': completed,
+    })
 
 
 # -- Worker

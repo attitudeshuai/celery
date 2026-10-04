@@ -7,13 +7,64 @@ from collections import defaultdict, deque
 
 from kombu import Producer
 
+from celery import uuid
 from celery.app import app_or_default
 from celery.utils.nodenames import anon_nodename
 from celery.utils.time import utcoffset
 
+from .continuity import validate_continuity_settings
 from .event import Event, get_exchange, group_from
 
 __all__ = ('EventDispatcher',)
+
+
+class _ContinuityRegistry:
+    """Process-wide continuity session/seq allocation.
+
+    Keyed by pid so that the session id and the sequence counter survive
+    broker reconnects (which recreate the dispatcher in the same process)
+    while a forked child or a restarted worker process starts a brand new
+    session with its own counter.
+    """
+
+    def __init__(self):
+        self._mutex = threading.Lock()
+        self._sessions = {}
+        self._counters = {}
+
+    def allocate(self, pid):
+        """Return ``(session_id, next_seq)`` for ``pid``.
+
+        Sequence numbers are strictly monotonic and never repeat within a
+        session, regardless of batch sends, remote event toggling or
+        offline buffering.
+        """
+        with self._mutex:
+            try:
+                seq = self._counters[pid] + 1
+            except KeyError:
+                self._sessions[pid] = uuid()
+                seq = 1
+            self._counters[pid] = seq
+            return self._sessions[pid], seq
+
+    def current(self, pid):
+        """Return ``(session_id, last_seq)`` for ``pid``.
+
+        ``session_id`` may be :const:`None` when no seq was allocated yet.
+        """
+        with self._mutex:
+            return self._sessions.get(pid), self._counters.get(pid, 0)
+
+    def reset(self):
+        """Forget all sessions (used by tests)."""
+        with self._mutex:
+            self._sessions.clear()
+            self._counters.clear()
+
+
+#: Process-wide registry shared by every dispatcher in this process.
+process_continuity = _ContinuityRegistry()
 
 
 class EventDispatcher:
@@ -46,6 +97,14 @@ class EventDispatcher:
     """
 
     DISABLED_TRANSPORTS = {'sql'}
+
+    #: Max events kept in the offline outbound buffer when the continuity
+    #: channel is enabled; beyond this the oldest buffered events are
+    #: dropped (and recorded) instead of growing memory without bound.
+    CONTINUITY_OUTBOUND_LIMIT = 10000
+
+    #: How many dropped sequence numbers to remember for a snapshot reply.
+    CONTINUITY_DROPPED_LEDGER = 1000
 
     app = None
 
@@ -81,6 +140,16 @@ class EventDispatcher:
         if not connection and channel:
             self.connection = channel.connection.client
         self.enabled = enabled
+        # The continuity channel is off by default; when off no
+        # session/seq fields are produced and behaviour is unchanged.
+        self.continuity_enabled = bool(
+            self.app.conf.event_continuity_enabled)
+        if self.continuity_enabled:
+            # Fail fast, before the worker/monitor starts serving.
+            validate_continuity_settings(self.app.conf)
+        self.continuity_dropped = 0
+        self._continuity_dropped_seqs = deque(
+            maxlen=self.CONTINUITY_DROPPED_LEDGER)
         conninfo = self.connection or self.app.connection_for_write()
         self.exchange = get_exchange(conninfo,
                                      name=self.app.conf.event_exchange)
@@ -135,9 +204,46 @@ class EventDispatcher:
         clock = None if blind else self.clock.forward()
         event = Event(type, hostname=self.hostname, utcoffset=utcoffset(),
                       pid=self.pid, clock=clock, **fields)
+        self._stamp_continuity(event)
         with self.mutex:
             return self._publish(event, producer,
                                  routing_key=type.replace('-', '.'), **kwargs)
+
+    def _stamp_continuity(self, event):
+        """Stamp an event with its session id and sequence number.
+
+        Each event gets exactly one sequence number, and the number is
+        never reused or reset: buffered batch sends, remote event toggling
+        and offline replay all go through the same process-wide allocator.
+        Replayed events already carry a stamp and are left untouched.
+        """
+        if not self.continuity_enabled or 'seq' in event:
+            return
+        session, seq = process_continuity.allocate(self.pid)
+        event['session'] = session
+        event['seq'] = seq
+
+    def _record_continuity_drop(self, event):
+        """Account for event(s) that could not be buffered nor published."""
+        events = event if isinstance(event, list) else [event]
+        for ev in events:
+            seq = ev.get('seq') if isinstance(ev, dict) else None
+            if seq is not None:
+                self._continuity_dropped_seqs.append(seq)
+            self.continuity_dropped += 1
+
+    def continuity_info(self):
+        """Return continuity bookkeeping for a resync snapshot reply."""
+        if not self.continuity_enabled:
+            return {'enabled': False}
+        session, seq = process_continuity.current(self.pid)
+        return {
+            'enabled': True,
+            'session': session,
+            'seq': seq,
+            'dropped': self.continuity_dropped,
+            'dropped_seqs': list(self._continuity_dropped_seqs),
+        }
 
     def _publish(self, event, producer, routing_key, retry=False,
                  retry_policy=None, utcoffset=utcoffset):
@@ -159,6 +265,14 @@ class EventDispatcher:
         except Exception:
             if not self.buffer_while_offline:
                 raise
+            if (self.continuity_enabled and
+                    len(self._outbound_buffer) >=
+                    self.CONTINUITY_OUTBOUND_LIMIT):
+                # The buffer is full after an outage: drop the new event
+                # but leave an auditable trace (the monitor will see the
+                # missing sequence number and resync against the snapshot).
+                self._record_continuity_drop(event)
+                return
             self._outbound_buffer.append((event, routing_key))
 
     def send(self, type, blind=False, utcoffset=utcoffset, retry=False,
@@ -187,6 +301,10 @@ class EventDispatcher:
                 event = Event(type, hostname=self.hostname,
                               utcoffset=utcoffset(),
                               pid=self.pid, clock=clock, **fields)
+                # Every event in a future *.multi batch gets its own
+                # sequence number at enqueue time, so batching neither
+                # skips nor duplicates sequence numbers.
+                self._stamp_continuity(event)
                 buf = self._group_buffer[group]
                 buf.append(event)
                 if len(buf) >= self.buffer_limit:

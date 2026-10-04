@@ -186,6 +186,24 @@ NAMESPACES = Namespace(
         queue_durable=Option(False, type='bool'),
         serializer=Option('json'),
         exchange=Option('celeryev', type='string'),
+        # Event continuity (reconcilable sequence channel).
+        # Disabled by default: when off the event stream is byte-for-byte
+        # compatible with older workers/monitors.
+        continuity_enabled=Option(False, type='bool'),
+        # How long (seconds) resolved gaps/discontinuity records are kept
+        # on the monitor for reconciliation queries.
+        continuity_state_ttl=Option(3600.0, type='float'),
+        # Timeout (seconds) of a single state resync request.
+        continuity_resync_timeout=Option(1.0, type='float'),
+        # Additional attempts made when a resync request times out/fails.
+        continuity_resync_retries=Option(2, type='int'),
+        # Maximum number of recently completed task ids returned in a
+        # resync snapshot.
+        continuity_resync_range=Option(1000, type='int'),
+        # Number of missing events tolerated without triggering a state
+        # resync; gaps at or below this size may still be filled by late
+        # (reordered) events.
+        continuity_gap_tolerance=Option(32, type='int'),
     ),
     redis=Namespace(
         __old__=old_ns('celery_redis'),

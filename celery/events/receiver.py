@@ -11,6 +11,7 @@ from celery.app import app_or_default
 from celery.exceptions import ImproperlyConfigured
 from celery.utils.time import adjust_timestamp
 
+from .continuity import ContinuityTracker
 from .event import get_exchange
 
 __all__ = ('EventReceiver',)
@@ -31,6 +32,13 @@ class EventReceiver(ConsumerMixin):
             This is  a map of event type names and their handlers.
             The special handler `"*"` captures all events that don't have a
             handler.
+        continuity (ContinuityTracker | bool): Continuity tracker used to
+            order events by session/sequence number, detect gaps and drive
+            state resynchronization.  Defaults to :const:`None`, which
+            enables tracking automatically when
+            :setting:`event_continuity_enabled` is set.  Pass :const:`False`
+            to force it off, or a pre-configured
+            :class:`~celery.events.continuity.ContinuityTracker`.
     """
 
     app = None
@@ -39,7 +47,7 @@ class EventReceiver(ConsumerMixin):
                  node_id=None, app=None, queue_prefix=None,
                  accept=None, queue_ttl=None, queue_expires=None,
                  queue_exclusive=None,
-                 queue_durable=None):
+                 queue_durable=None, continuity=None):
         self.app = app_or_default(app or self.app)
         self.channel = maybe_channel(channel)
         self.handlers = {} if handlers is None else handlers
@@ -78,6 +86,16 @@ class EventReceiver(ConsumerMixin):
         if accept is None:
             accept = {self.app.conf.event_serializer, 'json'}
         self.accept = accept
+        if continuity is False:
+            self.continuity = None
+        elif isinstance(continuity, ContinuityTracker):
+            self.continuity = continuity
+        elif continuity is None and self.app.conf.event_continuity_enabled:
+            # Validates the continuity settings as well, raising before the
+            # monitor starts serving when a value is invalid.
+            self.continuity = ContinuityTracker.from_app(self.app)
+        else:
+            self.continuity = None
 
     def process(self, type, event):
         """Process event by dispatching to configured handler."""
@@ -141,10 +159,25 @@ class EventReceiver(ConsumerMixin):
 
     def _receive(self, body, message, list=list, isinstance=isinstance):
         if isinstance(body, list):  # celery 4.0+: List of events
-            process, from_message = self.process, self.event_from_message
-            [process(*from_message(event)) for event in body]
+            # Batch messages preserve their intra-list order; the
+            # continuity tracker needs to see the events in that order.
+            [self._dispatch(self.event_from_message(event))
+             for event in body]
         else:
-            self.process(*self.event_from_message(body))
+            self._dispatch(self.event_from_message(body))
+
+    def _dispatch(self, received):
+        tracker = self.continuity
+        if tracker is None:
+            self.process(*received)
+            return
+        type, event = received
+        # The tracker holds out-of-order events, drops duplicates and may
+        # return previously held (or post-resync) events; every delivered
+        # event is dispatched in per-session sequence order. Events from
+        # old workers (without session/seq) pass through unchanged.
+        for delivered in tracker.observe(event):
+            self.process(delivered['type'], delivered)
 
     @property
     def connection(self):
